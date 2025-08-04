@@ -85,9 +85,9 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         next_input_ids = shift_tensor(inputs["tokens"], 0)
         chunk_size = _config.get("logprob_calculation_chunk_size", 1024)
         # Assert that sequence length is evenly divisible by the chunk size
-        assert seq_len % chunk_size == 0, (
-            f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
-        )
+        assert (
+            seq_len % chunk_size == 0
+        ), f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
         new_logprobs, entropies = calculate_logprobs(
             autocast_dtype,
@@ -127,6 +127,12 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             new_logprobs.dtype
         )
         weights = shift_tensor(inputs["weights"], 0.0)
+        self_kl_div = (
+            torch.exp(old_logprobs - new_logprobs) - (old_logprobs - new_logprobs) - 1.0
+        )
+        self_kl_div = torch.where(
+            torch.isnan(self_kl_div), torch.zeros_like(self_kl_div), self_kl_div
+        )
         # Assume missing old logprobs were sampled under the current policy
         old_logprobs = torch.where(
             torch.isnan(old_logprobs),
@@ -162,8 +168,10 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             kl_div = torch.zeros_like(policy_loss)
 
         policy_loss = policy_loss * weights * assistant_mask
+        self_kl_div = self_kl_div * weights * assistant_mask
         kl_div = kl_div * weights * assistant_mask
         mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
+        mean_self_kl = self_kl_div.sum() / (assistant_mask.sum() + 1e-6)
         mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
 
         # Compute mean entropy for the current step
@@ -174,6 +182,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
 
         trainer._metrics["train"]["learning_rate"].append(config.learning_rate)
         trainer._metrics["train"]["policy_loss"].append(mean_policy_loss.item())
+        trainer._metrics["train"]["self_kl_div"].append(mean_self_kl.item())
         trainer._metrics["train"]["entropy"].append(mean_entropy.item())  # type: ignore
         if config.beta > 0.0:
             trainer._metrics["train"]["kl_div"].append(mean_kl.item())
@@ -317,7 +326,9 @@ def _calculate_logprobs(
         chunk_logits = torch.matmul(chunk_hs, lm_head_t)  # [B, chunk_size, V]
         chunk_selected_logits = torch.gather(
             chunk_logits, dim=-1, index=chunk_input_ids.unsqueeze(-1)
-        ).squeeze(-1)  # [B, chunk_size]
+        ).squeeze(
+            -1
+        )  # [B, chunk_size]
         chunk_logsumexp = torch.logsumexp(chunk_logits, dim=-1)  # [B, chunk_size]
         log_probs[:, i : i + chunk_size] = chunk_selected_logits - chunk_logsumexp
 
