@@ -849,7 +849,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # assert torch.equal(mask, block_mask.to_dense()), "masks differ"
 
-        if True:
+        use_causal_advantages = dev_config.get("use_causal_advantages", False)
+        if use_causal_advantages:
             attn_bias = torch.zeros(
                 (
                     inputs["tokens"].shape[0],
@@ -863,6 +864,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self.score_mod = (
                 lambda score, b, h, q_idx, kv_idx: score + attn_bias[b, q_idx, kv_idx]
             )
+        else:
+            self.score_mod = None
 
         with self.activations_handling_ctx:
             hidden_states = self._model(
@@ -910,7 +913,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         del hidden_states, logits
 
-        if True:
+        if use_causal_advantages:
             if isinstance(self.activations_handling_ctx, OffloadActivations):
                 self.activations_handling_ctx.repack_tensors = True
             (attn_bias_grad,) = torch.autograd.grad(
@@ -944,7 +947,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 normalized_influence,
             )
             advantages += normalized_influence * torch.sign(advantages)
-        attn_bias.requires_grad = False
+            attn_bias.requires_grad = False
 
         old_logprobs = torch.where(
             torch.isnan(old_logprobs),

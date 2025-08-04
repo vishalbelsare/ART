@@ -17,3 +17,4 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     plot_tensors: bool
     precalculate_logprobs: bool
     scale_rewards: bool
+    use_causal_advantages: bool
