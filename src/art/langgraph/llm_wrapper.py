@@ -10,7 +10,7 @@ from langchain_openai import ChatOpenAI
 from .logging import FileLogger
 import json
 import asyncio
-from art.trajectories import Trajectory, History
+from art.trajectories import Trajectory
 from langchain_core.messages import ToolMessage, HumanMessage
 from langchain_core.prompt_values import ChatPromptValue
 from .message_utils import convert_langgraph_messages
@@ -79,10 +79,6 @@ def create_messages_from_logs(log_path: str, trajectory: Trajectory):
             if idx == 0:
                 trajectory.messages_and_choices = converted
                 trajectory.tools = tools[idx]
-            else:
-                trajectory.additional_histories.append(
-                    History(messages_and_choices=converted, tools=tools[idx])
-                )
         except Exception:
             pass
 
