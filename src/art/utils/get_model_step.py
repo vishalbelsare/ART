@@ -9,6 +9,8 @@ if TYPE_CHECKING:
 def get_step_from_dir(output_dir: str) -> int:
     os.makedirs(output_dir, exist_ok=True)
     checkpoint_dir = os.path.join(output_dir, "checkpoints")
+    print("checkpoint_dir", checkpoint_dir)
+    print("os.path.exists(checkpoint_dir)", os.path.exists(checkpoint_dir))
     if not os.path.exists(checkpoint_dir):
         return 0
 
@@ -23,4 +25,5 @@ def get_step_from_dir(output_dir: str) -> int:
 
 
 def get_model_step(model: "TrainableModel", art_path: str) -> int:
+    print("model=model, art_path=art_path", model, art_path)
     return get_step_from_dir(get_model_dir(model=model, art_path=art_path))

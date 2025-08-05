@@ -217,6 +217,7 @@ class LocalBackend(Backend):
         return self.__get_step(model)
 
     def __get_step(self, model: TrainableModel) -> int:
+        print("model, self._path", model, self._path)
         return get_model_step(model, self._path)
 
     async def _delete_checkpoints(
@@ -273,6 +274,7 @@ class LocalBackend(Backend):
         os.makedirs(parent_dir, exist_ok=True)
 
         # Get the file name for the current iteration, or default to 0 for non-trainable models
+        print("isinstance(model, TrainableModel)", isinstance(model, TrainableModel))
         iteration = self.__get_step(model) if isinstance(model, TrainableModel) else 0
         file_name = f"{iteration:04d}.jsonl"
 
