@@ -22,8 +22,8 @@ def get_openai_server_config(
             else None
         ),
         return_tokens_as_token_ids=True,
-        enable_auto_tool_choice=True,
-        tool_call_parser="hermes",
+        # enable_auto_tool_choice=True,
+        # tool_call_parser="hermes",
     )
     server_args.update(config.get("server_args", {}))
     engine_args = EngineArgs(

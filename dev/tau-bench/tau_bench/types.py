@@ -102,6 +102,7 @@ class RunConfig(BaseModel):
     is_multi_gpu: bool = False
     add_no_think: bool = False
     plot_tensors: bool = False
+    custom_think: bool = False
 
 
 class TauBenchTrainingConfig(BaseModel):

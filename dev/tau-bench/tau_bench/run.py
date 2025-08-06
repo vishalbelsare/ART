@@ -174,6 +174,7 @@ def agent_factory(tools_info: List[Dict[str, Any]], wiki, config: RunConfig) -> 
             api_key=config.api_key,
             base_url=config.base_url,
             base_model=config.base_model,
+            custom_think=config.custom_think,
         )
     elif config.agent_strategy == "tool-calling":
         # native tool calling

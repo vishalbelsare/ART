@@ -38,6 +38,32 @@ def clean_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return cleaned_messages
 
 
+def create_custom_think_prompt(tools: List[Dict[str, Any]]) -> str:
+    """Create a custom think prompt for the model"""
+    return f"""
+
+## Thinking and Response Format
+
+Think through the current state of the conversation and what you need to do next inside the <think></think> XML tags.
+Once you are done thinking, create your response inside the <response></response> XML tags.
+The response you create may either be a function call (described below) or a response to the user. It cannot be both.
+Even if you want to call a function as described below, return your response inside the <response></response> XML tags.
+    
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{tools}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{{"name": <function-name>, "arguments": <args-json-object>}}
+</tool_call>"""
+
+
 @limit_concurrency(256)
 async def rollout_tau_bench_task(
     model: art.Model[TauBenchPolicyConfig],
@@ -72,6 +98,9 @@ async def rollout_tau_bench_task(
     if config.add_no_think:
         env.wiki += "\n/no_think"
 
+    if config.custom_think:
+        env.wiki += create_custom_think_prompt(env.tools_info)
+
     # Create agent with the trainable model
     agent = agent_factory(
         tools_info=env.tools_info,
@@ -85,7 +114,7 @@ async def rollout_tau_bench_task(
     # Create trajectory object
     traj = art.Trajectory(
         messages_and_choices=[],
-        tools=env.tools_info,
+        tools=[] if config.custom_think else env.tools_info,
         reward=0,
         metadata={
             "task_index": str(task_index),

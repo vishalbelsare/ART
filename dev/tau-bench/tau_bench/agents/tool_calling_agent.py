@@ -1,6 +1,7 @@
 # Copyright Sierra
 
 import json
+import uuid
 from litellm import Choices, acompletion
 from litellm.types.utils import ModelResponse
 from typing import List, Optional, Dict, Any
@@ -40,6 +41,7 @@ class ToolCallingAgent(Agent):
         self.provider = provider
         self.temperature = temperature
         self.messages = []
+        self.custom_think = kwargs.get("custom_think", False)
 
     async def llm_completion(self, messages: List[Dict[str, Any]]) -> ModelResponse:
         completion_obj = await acompletion(
@@ -76,17 +78,29 @@ class ToolCallingAgent(Agent):
                 max_completion_tokens, res.usage.completion_tokens
             )  # type: ignore
             next_message = res.choices[0].message.model_dump()  # type: ignore
-            if (
+
+            custom_think_user_text_append = ""
+
+            if self.custom_think:
+                custom_think_user_text_append = """
+
+Start your response by thinking through your next action inside <think></think> XML tags.
+Once you are done thinking, create your response inside the <response></response> XML tags.
+If you want to call a function, remember to enclose the function call in <tool_call></tool_call> XML tags.
+"""
+                action = parse_custom_think_to_action(next_message)
+                self.messages.append(next_message)
+            elif (
                 "tool_calls" in next_message
                 and next_message["tool_calls"] is not None
                 and len(next_message["tool_calls"]) > 0
                 and next_message["tool_calls"][0]["function"] is not None
             ):
                 next_message["tool_calls"] = next_message["tool_calls"][:1]
-            self.messages.append(next_message)
+                self.messages.append(next_message)
+                action = message_to_action(next_message)
 
             total_cost += res._hidden_params.get("response_cost") or 0.0
-            action = message_to_action(next_message)
             env_response = await env.step(action)
             reward = env_response.reward
             info = {**info, **env_response.info.model_dump()}
@@ -94,8 +108,12 @@ class ToolCallingAgent(Agent):
                 self.messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": next_message["tool_calls"][0]["id"],
-                        "name": next_message["tool_calls"][0]["function"]["name"],
+                        "tool_call_id": str(uuid.uuid4())
+                        if self.custom_think
+                        else next_message["tool_calls"][0]["id"],
+                        "name": action.name
+                        if self.custom_think
+                        else next_message["tool_calls"][0]["function"]["name"],
                         "content": env_response.observation,
                     }
                 )
@@ -103,7 +121,7 @@ class ToolCallingAgent(Agent):
                 self.messages.append(
                     {
                         "role": "user",
-                        "content": env_response.observation,
+                        "content": f"{env_response.observation}{custom_think_user_text_append}",
                     }
                 )
             if env_response.done:
@@ -131,6 +149,7 @@ class ToolCallingRLAgent(ToolCallingAgent):
         self.base_url = kwargs.get("base_url", None)
         self.base_model = kwargs.get("base_model", None)
         self.choices = []
+        self.custom_think = kwargs.get("custom_think", False)
 
     async def llm_completion(self, messages: List[Dict[str, Any]]):
         response = await acompletion_with_limit_concurrency(
@@ -139,7 +158,7 @@ class ToolCallingRLAgent(ToolCallingAgent):
             custom_llm_provider=self.provider,
             api_key=self.api_key,
             base_url=self.base_url,
-            tools=self.tools_info,
+            tools=[] if self.custom_think else self.tools_info,
             temperature=self.temperature,
             max_completion_tokens=1024,
             logprobs=False if self.provider == "openai" else True,
@@ -175,6 +194,34 @@ class ToolCallingRLAgent(ToolCallingAgent):
                             message.pop(key)
                 messages_and_choices.append(message)
         return messages_and_choices
+
+
+def parse_custom_think_to_action(message: Dict[str, Any]) -> Action:
+    import re
+
+    content = message.get("content", "")
+
+    # Check for tool call within response
+    tool_call_match = re.search(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL)
+    if tool_call_match:
+        try:
+            tool_call_json = json.loads(tool_call_match.group(1).strip())
+            return Action(
+                name=tool_call_json["name"], kwargs=tool_call_json["arguments"]
+            )
+        except (json.JSONDecodeError, KeyError):
+            print(f"Error parsing tool call: {tool_call_match.group(1).strip()}")
+
+    # Extract response section
+    response_match = re.search(r"<response>(.*?)</response>", content, re.DOTALL)
+    if not response_match:
+        # remove the <think> and </think> tags and everything in between
+        content = re.sub(r"<think>(.*?)</think>", "", content, re.DOTALL).strip()
+        return Action(name=RESPOND_ACTION_NAME, kwargs={"content": content})
+
+    response_content = response_match.group(1).strip()
+
+    return Action(name=RESPOND_ACTION_NAME, kwargs={"content": response_content})
 
 
 def message_to_action(
