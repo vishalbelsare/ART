@@ -164,8 +164,8 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 signed_logprob_diff, signed_logprob_diff_clamp
             )
             logprobs_diff_max = advantage_signs * signed_logprob_diff_max
-            prob_ratio = torch.exp(logprob_diff)
-            policy_loss = -advantages * logprobs_diff_max
+            prob_ratio = torch.exp(logprobs_diff_max)
+            policy_loss = -advantages * prob_ratio
         else:
             policy_loss = -torch.min(
                 prob_ratio * advantages,
