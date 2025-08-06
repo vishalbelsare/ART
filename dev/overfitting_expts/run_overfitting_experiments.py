@@ -77,7 +77,6 @@ def launch_model(model_key: str):
         uv remove openpipe-art
         uv add --editable ~/ART --extra backend --extra plotting
 
-        cd ~/ART/dev/overfitting_expts
         echo '{model_json}' > model_config.json
         uv run yes_no_maybe.py
     """
