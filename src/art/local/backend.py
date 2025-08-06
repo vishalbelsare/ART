@@ -276,6 +276,7 @@ class LocalBackend(Backend):
         # Get the file name for the current iteration, or default to 0 for non-trainable models
         print("isinstance(model, TrainableModel)", isinstance(model, TrainableModel))
         iteration = self.__get_step(model) if isinstance(model, TrainableModel) else 0
+        print(iteration)
         file_name = f"{iteration:04d}.jsonl"
 
         # Write the logs to the file
@@ -310,7 +311,7 @@ class LocalBackend(Backend):
         # Calculate average standard deviation of rewards within groups
         averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
 
-        self._log_metrics(model, averages, split)
+        self._log_metrics(model, averages, split, step=iteration)
 
     def _trajectory_log(self, trajectory: Trajectory) -> str:
         """Format a trajectory into a readable log string."""
