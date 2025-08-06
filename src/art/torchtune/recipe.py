@@ -918,7 +918,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         del hidden_states, logits
 
         if return_new_logprobs:
-            return new_logprobs
+            return torch.nn.functional.pad(new_logprobs[:, :-1], (1, 0), value=0.0)
 
         if use_causal_advantages:
             if isinstance(self.activations_handling_ctx, OffloadActivations):
