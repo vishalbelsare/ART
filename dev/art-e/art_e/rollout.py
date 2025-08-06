@@ -298,15 +298,19 @@ async def rollout(
             rubric.ran_out_of_turns = True
             break
 
+        litellm_params = model.litellm_completion_params()
+        if scenario.split == "test":
+            litellm_params["temperature"] = 0
+
         async with traj.track_duration("llm_completion"):
             llm_response = await acompletion(
+                # **litellm_params,
                 **model.litellm_completion_params(),
                 messages=traj.messages(),
                 caching=not model.trainable,
                 max_completion_tokens=model.config.max_tokens,
                 tools=traj.tools,
-                tool_choice="required",
-                # tool_choice=None if model.trainable else "required",
+                tool_choice=None if model.trainable else "required",
             )  # type: ignore
 
         assert isinstance(llm_response, ModelResponse)
