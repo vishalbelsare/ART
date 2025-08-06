@@ -1,0 +1,14 @@
+[project]
+name = "overfitting-expts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.99.1",
+    "skypilot-nightly[runpod,hyperbolic]==1.0.0.dev20250717",
+    "openpipe-art",
+]
+
+[tool.uv.sources]
+openpipe-art = { path = "../../", editable = true }
