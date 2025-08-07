@@ -82,16 +82,42 @@ class LocalBackend(Backend):
         return self
 
     def __exit__(self, *excinfo):
-        self.close()
+        self._cleanup()
 
-    def close(self):
+    def _cleanup(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
+        It also finishes any active Weights & Biases runs and Weave clients.
         """
+        # 1. Close any model service processes
         for _, service in self._services.items():
             close_method = getattr(service, "close", None)
             if callable(close_method):
-                close_method()
+                try:
+                    close_method()
+                except Exception as e:
+                    print(f"Error while closing service {service}: {e}")
+
+        # 2. Finish all active Weights & Biases runs so metrics get written
+        for run in self._wandb_runs.values():
+            try:
+                if run is not None and not getattr(run, "_is_finished", False):
+                    run.finish()
+            except Exception as e:
+                print(f"Error while finishing W&B run {run}: {e}")
+
+        # 3. Close Weave clients to flush any pending traces
+        for client in self._weave_clients.values():
+            try:
+                client.finish()
+            except Exception as e:
+                print(f"Error while finishing Weave client {client}: {e}")
+
+    async def close(self) -> None:
+        """
+        Satisfies the asynchronous contract established by the `art.backend.Backend.close` base method.
+        """
+        self._cleanup()
 
     async def register(
         self,
