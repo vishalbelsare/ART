@@ -209,6 +209,7 @@ trainable_models["017"].config.training_config.trajectories_per_group = 32
 trainable_models["017"].config.training_config.groups_per_step = 32
 trainable_models["017"].config.training_config.training_dataset_size = 32
 trainable_models["017"].config.training_config.learning_rate = 5e-7
+trainable_models["017"].config.training_config.num_epochs = 200
 trainable_models["017"].config.run_config.skip_eval = False
 trainable_models["017"].config.run_config.reward_type = "real"
 trainable_models["017"].config.run_config.user_model = "gpt-4.1"
