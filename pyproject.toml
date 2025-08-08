@@ -3,7 +3,7 @@ name = "openpipe-art"
 version = "0.4.5"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "openai>=1.65.5,<=1.99.1",
     "typer>=0.15.2",
