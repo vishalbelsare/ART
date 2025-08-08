@@ -90,12 +90,15 @@ class LocalBackend(Backend):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.close()
+        self._close()
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
+        self._close()
+
+    def _close(self) -> None:
         for _, service in self._services.items():
             close_proxy(service)
 
@@ -422,9 +425,9 @@ class LocalBackend(Backend):
             num_gradient_steps = int(
                 result.pop("num_gradient_steps", estimated_gradient_steps)
             )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            assert (
+                num_gradient_steps == estimated_gradient_steps
+            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
@@ -514,14 +517,16 @@ class LocalBackend(Backend):
     async def _experimental_pull_from_s3(
         self,
         model: Model,
-        step: int | None = None,
+        *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
         delete: bool = False,
+        only_step: int | Literal["latest"] | None = None,
+        # LocalBackend extensions (not part of the base interface)
+        step: int | None = None,
         exclude: list[ExcludableOption] | None = None,
         latest_only: bool = False,
-        only_step: int | Literal["latest"] | None = None,
     ) -> None:
         """Download the model directory from S3 into local Backend storage. Right now this can be used to pull trajectory logs for processing or model checkpoints.
         Args:
@@ -584,6 +589,7 @@ class LocalBackend(Backend):
     async def _experimental_push_to_s3(
         self,
         model: Model,
+        *,
         s3_bucket: str | None = None,
         prefix: str | None = None,
         verbose: bool = False,
