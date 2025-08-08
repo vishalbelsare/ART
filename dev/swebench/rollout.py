@@ -12,7 +12,6 @@ from eval import eval_instance
 from grpclib.exceptions import StreamTerminatedError
 from instances import Instance
 from langfuse.decorators import observe
-from logs import setup_agent_logger
 from pydantic import BaseModel
 from requests import adapters as requests_adapters
 from requests.exceptions import ConnectionError, ConnectTimeout, SSLError
@@ -27,6 +26,7 @@ from swerex.exceptions import CommandTimeoutError, SwerexException
 from urllib3.exceptions import ProtocolError
 
 import art
+from logs import setup_agent_logger
 from swebench.harness.modal_eval.run_evaluation_modal import app, run_instance_modal
 from swebench.harness.test_spec.test_spec import make_test_spec
 
