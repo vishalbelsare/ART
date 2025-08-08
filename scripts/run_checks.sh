@@ -26,6 +26,7 @@ fi
 
 # Track if any checks fail
 CHECKS_PASSED=true
+TYPECHECK_FAILED=false
 
 # Run format check
 echo "📝 Checking code formatting..."
@@ -69,6 +70,59 @@ else
         CHECKS_PASSED=false
     fi
 fi
+echo
+
+# Run type checking (Pyright)
+echo "🧠 Running type checking..."
+TMP_PYRIGHT_JSON=$(mktemp)
+echo "  Running: uv run pyright --outputjson src"
+# Capture JSON output quietly regardless of success/failure
+if uv run pyright --outputjson src > "$TMP_PYRIGHT_JSON" 2>/dev/null; then
+    : # success, continue
+else
+    : # non-zero exit means errors may be present; we'll parse JSON next
+fi
+
+# Parse counts from JSON (errors, warnings, information)
+PYRIGHT_COUNTS=$(python3 - "$TMP_PYRIGHT_JSON" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, 'r') as f:
+        data = json.load(f)
+except Exception:
+    print("PARSE_ERROR")
+    sys.exit(0)
+
+counts = {"error": 0, "warning": 0, "information": 0}
+for d in data.get("generalDiagnostics", []):
+    sev = d.get("severity")
+    if sev in counts:
+        counts[sev] += 1
+
+print(f"{counts['error']} {counts['warning']} {counts['information']}")
+PY
+)
+
+if [[ "$PYRIGHT_COUNTS" == "PARSE_ERROR" ]]; then
+    echo -e "${RED}❌ Type checking failed (unable to parse results)${NC}"
+    CHECKS_PASSED=false
+    TYPECHECK_FAILED=true
+else
+    ERR_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $1}')
+    WARN_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $2}')
+    INFO_COUNT=$(echo "$PYRIGHT_COUNTS" | awk '{print $3}')
+    if [[ "$ERR_COUNT" -gt 0 ]]; then
+        echo -e "${RED}❌ Type checking failed${NC}"
+        echo "  Errors: $ERR_COUNT, Warnings: $WARN_COUNT, Info: $INFO_COUNT"
+        CHECKS_PASSED=false
+        TYPECHECK_FAILED=true
+    else
+        echo -e "${GREEN}✅ Type checking passed${NC}"
+        echo "  Errors: $ERR_COUNT, Warnings: $WARN_COUNT, Info: $INFO_COUNT"
+    fi
+fi
+rm -f "$TMP_PYRIGHT_JSON"
 echo
 
 # Check if uv.lock is in sync with pyproject.toml
@@ -123,7 +177,11 @@ if $CHECKS_PASSED; then
 else
     echo -e "${RED}❌ Some checks failed${NC}"
     if [[ -z "$FIX_FLAG" ]]; then
-        echo -e "💡 Tip: Run ${YELLOW}./scripts/run_checks.sh --fix${NC} to automatically fix some issues"
+        if $TYPECHECK_FAILED; then
+            echo -e "💡 Tip: Type errors can't be auto-fixed by --fix. Re-run ${YELLOW}uv run pyright src${NC} to see full diagnostics."
+        else
+            echo -e "💡 Tip: Run ${YELLOW}./scripts/run_checks.sh --fix${NC} to automatically fix some issues"
+        fi
     fi
     exit 1
 fi
