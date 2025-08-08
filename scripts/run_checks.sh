@@ -127,9 +127,11 @@ echo
 
 # Check if uv.lock is in sync with pyproject.toml
 echo "🔒 Checking if uv.lock is up to date..."
+PRIMARY_EXTRAS=(--all-extras)
+FALLBACK_EXTRAS=(--extra plotting --extra skypilot)
 if [[ -n "$FIX_FLAG" ]]; then
-    echo "  Running: uv sync"
-    if uv sync; then
+    echo "  Attempting: uv sync --all-extras"
+    if uv sync "${PRIMARY_EXTRAS[@]}"; then
         # Check if uv.lock was modified
         if git diff --quiet uv.lock 2>/dev/null; then
             echo -e "${GREEN}✅ Dependencies are in sync${NC}"
@@ -138,31 +140,53 @@ if [[ -n "$FIX_FLAG" ]]; then
             echo -e "${YELLOW}  Don't forget to commit the updated uv.lock file${NC}"
         fi
     else
-        echo -e "${RED}❌ Failed to sync dependencies${NC}"
-        CHECKS_PASSED=false
+        echo "  Primary sync failed; falling back: uv sync --extra plotting --extra skypilot"
+        if uv sync "${FALLBACK_EXTRAS[@]}"; then
+            if git diff --quiet uv.lock 2>/dev/null; then
+                echo -e "${GREEN}✅ Dependencies are in sync (fallback extras)${NC}"
+            else
+                echo -e "${GREEN}✅ Updated uv.lock to match pyproject.toml (fallback extras)${NC}"
+                echo -e "${YELLOW}  Don't forget to commit the updated uv.lock file${NC}"
+            fi
+        else
+            echo -e "${RED}❌ Failed to sync dependencies (both primary and fallback)${NC}"
+            CHECKS_PASSED=false
+        fi
     fi
 else
     echo "  Checking if uv sync would modify uv.lock..."
     # Create a temporary copy of uv.lock
     cp uv.lock uv.lock.backup 2>/dev/null || touch uv.lock.backup
     
-    # Run uv sync quietly
-    if uv sync --quiet 2>/dev/null; then
+    # Try primary extras quietly
+    if uv sync --quiet "${PRIMARY_EXTRAS[@]}" 2>/dev/null; then
         # Check if uv.lock was modified
         if diff -q uv.lock uv.lock.backup >/dev/null 2>&1; then
             echo -e "${GREEN}✅ uv.lock is up to date${NC}"
         else
             echo -e "${YELLOW}⚠️  uv.lock is out of sync with pyproject.toml${NC}"
-            echo "  Run 'uv sync' and commit the changes"
+            echo "  Run 'uv sync --all-extras' and commit the changes"
             CHECKS_PASSED=false
             # Restore the original uv.lock
             mv uv.lock.backup uv.lock
         fi
     else
-        echo -e "${RED}❌ Failed to check dependencies${NC}"
-        CHECKS_PASSED=false
-        # Restore the original uv.lock if it exists
-        [ -f uv.lock.backup ] && mv uv.lock.backup uv.lock
+        echo "  Primary check failed; trying fallback extras quietly..."
+        if uv sync --quiet "${FALLBACK_EXTRAS[@]}" 2>/dev/null; then
+            if diff -q uv.lock uv.lock.backup >/dev/null 2>&1; then
+                echo -e "${GREEN}✅ uv.lock is up to date (checked with fallback extras)${NC}"
+            else
+                echo -e "${YELLOW}⚠️  uv.lock is out of sync with pyproject.toml (fallback extras)${NC}"
+                echo "  Run 'uv sync --extra plotting --extra skypilot' and commit the changes"
+                CHECKS_PASSED=false
+                mv uv.lock.backup uv.lock
+            fi
+        else
+            echo -e "${RED}❌ Failed to check dependencies (both primary and fallback)${NC}"
+            CHECKS_PASSED=false
+            # Restore the original uv.lock if it exists
+            [ -f uv.lock.backup ] && mv uv.lock.backup uv.lock
+        fi
     fi
     
     # Clean up backup file
