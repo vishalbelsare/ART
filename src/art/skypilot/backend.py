@@ -189,7 +189,7 @@ class SkyPilotBackend(Backend):
 
         if art_version_is_semver:
             art_installation_command = (
-                f"uv pip install openpipe-art[backend]=={art_version}"
+                f'uv pip install "openpipe-art[backend] @ git+https://github.com/OpenPipe/ART.git@d5caac2"'
             )
         elif os.path.exists(art_version):
             # copy the contents of the art_path onto the new machine
