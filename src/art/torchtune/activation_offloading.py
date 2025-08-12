@@ -17,7 +17,6 @@ import torchao
 from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 from torchao.dtypes.nf4tensor import NF4Tensor
-
 from torchtune.modules import TiedLinear
 from torchtune.utils import get_logger
 
@@ -78,9 +77,7 @@ class OffloadActivations(saved_tensors_hooks):
         self.min_tensor_size_bytes = (
             min_offload_size  # we don't want to bother with small tensors
         )
-        self.tracker = (
-            {}
-        )  # tensor_id => (new_tensor, if_modified)  ---> track what saved/offloaded tensors are where
+        self.tracker = {}  # tensor_id => (new_tensor, if_modified)  ---> track what saved/offloaded tensors are where
         self.tensor_id: int = 0
         self.is_first_forward_call = True
         self.is_first_backward_call = True
@@ -185,9 +182,9 @@ class OffloadActivations(saved_tensors_hooks):
         def pack_tensor(activation: torch.Tensor) -> int:
             # activations are passed in during forward pass - from here we take over and return a unique id
             if self.is_first_forward_call:
-                assert (
-                    len(self.tracker) == 0
-                ), "backward pass should have cleared tracker of all tensors"
+                assert len(self.tracker) == 0, (
+                    "backward pass should have cleared tracker of all tensors"
+                )
 
                 # set training phase trackers
                 self.is_first_forward_call = False
@@ -231,9 +228,9 @@ class OffloadActivations(saved_tensors_hooks):
                 self.is_first_backward_call = False
                 self.is_first_forward_call = True
 
-            assert (
-                unpack_tensor_id in self.tracker
-            ), f"untracked tensor with id {unpack_tensor_id}"
+            assert unpack_tensor_id in self.tracker, (
+                f"untracked tensor with id {unpack_tensor_id}"
+            )
 
             maybe_gpu_tensor, modified = self.tracker[unpack_tensor_id]
             if modified:
@@ -258,7 +255,7 @@ class OffloadActivations(saved_tensors_hooks):
                         del self.bwd_tensor_stash[id]
 
                 # Register a callback to the end of autograd to clean everything up
-                torch.autograd.variable.Variable._execution_engine.queue_callback(
+                torch.autograd.variable.Variable._execution_engine.queue_callback(  # type: ignore
                     wait_and_del_remaining_references
                 )
 
@@ -270,9 +267,9 @@ class OffloadActivations(saved_tensors_hooks):
                 self.is_first_backward_call = False
                 self.is_first_forward_call = True
 
-            assert (
-                unpack_tensor_id in self.tracker
-            ), f"untracked tensor with id {unpack_tensor_id}"
+            assert unpack_tensor_id in self.tracker, (
+                f"untracked tensor with id {unpack_tensor_id}"
+            )
 
             maybe_gpu_tensor, modified = self.tracker[unpack_tensor_id]
             if modified:
@@ -290,6 +287,7 @@ class OffloadActivations(saved_tensors_hooks):
                 if unpack_tensor_id in self.fwd_stash:
                     maybe_gpu_tensor = self.fwd_stash[unpack_tensor_id][0]
                     brought_back_from_cpu = False
+                    storage_refcount = 0
                 else:
                     # Kick off the process to bring tensors back
                     with torch.cuda.stream(self.s1):  # type: ignore

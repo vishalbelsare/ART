@@ -24,11 +24,10 @@ from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.attention import flex_attention
-from torchtune.modules import attention_utils
 from torch.optim import Optimizer
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchtune import config, modules, training, utils
-from torchtune.modules import TransformerDecoder
+from torchtune.modules import TransformerDecoder, attention_utils
 from torchtune.modules.moe import utils as moe_utils
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import (
@@ -48,9 +47,9 @@ from torchtune.training.quantization import (
 )
 from tqdm import tqdm
 
-from .activation_offloading import get_act_offloading_ctx_manager, OffloadActivations
 from .. import dev, types
 from ..local.pack import PackedTensors, packed_tensors_from_dir
+from .activation_offloading import OffloadActivations, get_act_offloading_ctx_manager
 from .batch import Batch
 from .config import (
     CompileConfig,
@@ -863,6 +862,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 lambda score, b, h, q_idx, kv_idx: score + attn_bias[b, q_idx, kv_idx]
             )
         else:
+            attn_bias = torch.tensor(0.0, device=self._device)
             self.score_mod = None
 
         with self.activations_handling_ctx:

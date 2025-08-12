@@ -1,5 +1,6 @@
-from typing import Literal
 import colorsys
+from typing import Literal
+
 import numpy as np
 
 
