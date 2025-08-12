@@ -5,9 +5,10 @@ Aggregates by instance_id, taking the last occurrence.
 """
 
 import json
-import polars as pl
-from collections import Counter
 import re
+from collections import Counter
+
+import polars as pl
 
 
 def load_test_results(

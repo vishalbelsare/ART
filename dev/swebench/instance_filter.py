@@ -8,9 +8,10 @@ Filters instances that meet all of the following criteria:
 """
 
 import json
-import polars as pl
-from typing import Dict, Set
 from collections import defaultdict
+from typing import Dict, Set
+
+import polars as pl
 
 
 def load_test_results(

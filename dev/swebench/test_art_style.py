@@ -4,14 +4,15 @@ Test script for ART-style rollout implementation.
 Tests a single instance to verify everything is working.
 """
 
-import art
 import asyncio
-from dotenv import load_dotenv
 import os
 
-from art_style_rollout import art_style_rollout, ARTModelConfig
-from instances import get_filtered_swe_smith_instances_df, as_instances_iter
+from art_style_rollout import ARTModelConfig, art_style_rollout
+from dotenv import load_dotenv
+from instances import as_instances_iter, get_filtered_swe_smith_instances_df
 from sandbox import new_sandbox
+
+import art
 
 
 async def test_single_rollout():

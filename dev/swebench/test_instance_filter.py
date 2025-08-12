@@ -2,9 +2,9 @@
 """Test the instance filter functionality."""
 
 from instance_filter import (
-    load_test_results,
-    get_quality_instance_ids,
     filter_quality_instances,
+    get_quality_instance_ids,
+    load_test_results,
     save_quality_instance_list,
 )
 from instances import get_filtered_swe_smith_instances_df

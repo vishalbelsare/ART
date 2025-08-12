@@ -7,12 +7,12 @@ Runs up to 256 sandboxes concurrently using the Daytona provider.
 import asyncio
 import json
 import os
-from typing import Dict, Any
 from datetime import datetime
-from dotenv import load_dotenv
-import daytona_sdk
+from typing import Any, Dict
 
-from instances import get_filtered_swe_smith_instances_df, as_instances_iter, Instance
+import daytona_sdk
+from dotenv import load_dotenv
+from instances import Instance, as_instances_iter, get_filtered_swe_smith_instances_df
 from sandbox.new import new_sandbox
 from sandbox.sandbox import Provider
 

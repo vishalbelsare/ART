@@ -4,12 +4,11 @@ from typing import AsyncIterator
 
 import daytona_sdk
 import modal
-from typing import AsyncIterator
 from tenacity import (
     retry,
+    retry_if_exception_message,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_message,
 )
 
 from .daytona import DaytonaSandbox

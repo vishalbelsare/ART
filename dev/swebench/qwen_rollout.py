@@ -1,20 +1,20 @@
 import asyncio
-from dotenv import load_dotenv
 import json
+import traceback
+
 import openai
+from dotenv import load_dotenv
+from instances import as_instances_iter, get_filtered_swe_smith_instances_df
 from openai.types.chat import (
-    ChatCompletionMessageParam,
-    ChatCompletionToolParam,
     ChatCompletionAssistantMessageParam,
+    ChatCompletionMessageParam,
     ChatCompletionToolMessageParam,
+    ChatCompletionToolParam,
 )
 from openai.types.chat.chat_completion_message_tool_call_param import (
     ChatCompletionMessageToolCallParam,
 )
-import traceback
-
-from instances import get_filtered_swe_smith_instances_df, as_instances_iter
-from sandbox import new_sandbox, Sandbox
+from sandbox import Sandbox, new_sandbox
 
 load_dotenv()
 

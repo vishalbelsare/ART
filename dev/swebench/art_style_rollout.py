@@ -1,14 +1,15 @@
-import art
 import json
-from openai.types.chat import (
-    ChatCompletionToolParam,
-    ChatCompletionToolMessageParam,
-)
-from pydantic import BaseModel
 import traceback
 
 from instances import Instance
+from openai.types.chat import (
+    ChatCompletionToolMessageParam,
+    ChatCompletionToolParam,
+)
+from pydantic import BaseModel
 from sandbox import Sandbox
+
+import art
 
 
 class ARTModelConfig(BaseModel):

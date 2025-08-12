@@ -4,17 +4,18 @@ ART-style training script for SWE-bench using a simplified rollout function.
 Inspired by qwen_rollout.py but following ART idioms.
 """
 
-import art
-import asyncio
-from dotenv import load_dotenv
-import os
 import argparse
-import torch
+import asyncio
+import os
 
-from art_style_rollout import art_style_rollout, ARTModelConfig
-from instances import get_filtered_swe_smith_instances_df, as_instances_iter, Instance
-from sandbox import new_sandbox
+import torch
+from art_style_rollout import ARTModelConfig, art_style_rollout
+from dotenv import load_dotenv
 from instance_filter import filter_quality_instances
+from instances import Instance, as_instances_iter, get_filtered_swe_smith_instances_df
+from sandbox import new_sandbox
+
+import art
 
 
 def setup_environment():
