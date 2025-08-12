@@ -1,13 +1,15 @@
-from fastapi import FastAPI, Body
-from fastapi.responses import StreamingResponse
 import json
-import pydantic
 import socket
-import typer
 from typing import Any, AsyncIterator
+
+import pydantic
+import typer
 import uvicorn
+from fastapi import Body, FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import dev
+from .errors import ARTError
 from .local import LocalBackend
 from .model import Model, TrainableModel
 from .trajectories import TrajectoryGroup
@@ -44,6 +46,12 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     backend = LocalBackend()
     app = FastAPI()
+
+    # Add exception handler for ARTError
+    @app.exception_handler(ARTError)
+    async def art_error_handler(request: Request, exc: ARTError):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
     app.post("/register")(backend.register)

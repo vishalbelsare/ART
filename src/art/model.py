@@ -1,7 +1,8 @@
+from typing import TYPE_CHECKING, Generic, Iterable, Optional, TypeVar, cast, overload
+
 import httpx
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pydantic import BaseModel
-from typing import TYPE_CHECKING, cast, Generic, Iterable, Optional, overload, TypeVar
 from typing_extensions import Never
 
 from . import dev
@@ -308,7 +309,7 @@ class TrainableModel(Model[ModelConfig], Generic[ModelConfig]):
             self, _openai_client_config
         )
 
-        # Populate the new top-level inference fields so that the rest of the
+        # Populate the top-level inference fields so that the rest of the
         # code (and any user code) can create an OpenAI client immediately.
         self.inference_base_url = base_url
         self.inference_api_key = api_key

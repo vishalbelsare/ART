@@ -61,12 +61,23 @@
         ]
       },
       {
+        "group": "Features",
+        "pages": [
+          "features/checkpoint-forking",
+          "features/additional-histories"
+        ]
+      },
+      {
         "group": "Tutorials",
         "pages": ["tutorials/summarizer"]
       },
       {
         "group": "Resources",
         "pages": ["resources/models", "resources/glossary"]
+      },
+      {
+        "group": "Experimental",
+        "pages": ["experimental/gspo"]
       }
     ]
   },

@@ -1,7 +1,8 @@
-import httpx
 import json
+from typing import TYPE_CHECKING, AsyncIterator, Literal
+
+import httpx
 from tqdm import auto as tqdm
-from typing import AsyncIterator, TYPE_CHECKING
 
 from art.utils import log_http_errors
 from art.utils.deploy_model import LoRADeploymentJob, LoRADeploymentProvider
@@ -138,8 +139,14 @@ class Backend:
         prefix: str | None = None,
         verbose: bool = False,
         delete: bool = False,
+        only_step: int | Literal["latest"] | None = None,
     ) -> None:
-        """Download the model directory from S3 into file system where the LocalBackend is running. Right now this can be used to pull trajectory logs for processing or model checkpoints."""
+        """Download the model directory from S3 into file system where the LocalBackend is running. Right now this can be used to pull trajectory logs for processing or model checkpoints.
+
+        Args:
+            only_step: If specified, only pull this specific step. Can be an int for a specific step,
+                      or "latest" to pull only the latest checkpoint. If None, pulls all steps.
+        """
         response = await self._client.post(
             "/_experimental_pull_from_s3",
             json={
@@ -148,6 +155,7 @@ class Backend:
                 "prefix": prefix,
                 "verbose": verbose,
                 "delete": delete,
+                "only_step": only_step,
             },
             timeout=600,
         )
@@ -178,10 +186,49 @@ class Backend:
         response.raise_for_status()
 
     @log_http_errors
+    async def _experimental_fork_checkpoint(
+        self,
+        model: "Model",
+        from_model: str,
+        from_project: str | None = None,
+        from_s3_bucket: str | None = None,
+        not_after_step: int | None = None,
+        verbose: bool = False,
+        prefix: str | None = None,
+    ) -> None:
+        """Fork a checkpoint from another model to initialize this model.
+
+        Args:
+            model: The model to fork to.
+            from_model: The name of the model to fork from.
+            from_project: The project of the model to fork from. Defaults to model.project.
+            from_s3_bucket: Optional S3 bucket to pull the checkpoint from. If provided,
+                will pull from S3 first. Otherwise, will fork from local disk.
+            not_after_step: Optional step number. If provided, will copy the last saved
+                checkpoint that is <= this step. Otherwise, copies the latest checkpoint.
+            verbose: Whether to print verbose output.
+            prefix: Optional S3 prefix for the bucket.
+        """
+        response = await self._client.post(
+            "/_experimental_fork_checkpoint",
+            json={
+                "model": model.model_dump(),
+                "from_model": from_model,
+                "from_project": from_project,
+                "from_s3_bucket": from_s3_bucket,
+                "not_after_step": not_after_step,
+                "verbose": verbose,
+                "prefix": prefix,
+            },
+            timeout=600,
+        )
+        response.raise_for_status()
+
+    @log_http_errors
     async def _experimental_deploy(
         self,
         deploy_to: LoRADeploymentProvider,
-        model: "Model",
+        model: "TrainableModel",
         step: int | None = None,
         s3_bucket: str | None = None,
         prefix: str | None = None,

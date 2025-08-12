@@ -26,6 +26,7 @@ This project uses [ruff](https://github.com/astral-sh/ruff) for both code format
 ```
 
 The `run_checks.sh` script will:
+
 1. Check code formatting with ruff
 2. Check for linting issues with ruff
 3. Verify that `uv.lock` is in sync with `pyproject.toml`
@@ -36,37 +37,31 @@ These checks are automatically run in CI for all pull requests. If your PR fails
 
 To create a new release:
 
-1. **Decide on version bump type**:
+1. **Review merged PRs since the last release**:
+   - Go to the [pull requests page](https://github.com/OpenPipe/ART/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc)
+   - Review PRs merged since the last release to understand what changed
+   - Note any breaking changes, new features, or important bug fixes
 
-   - `patch`: Bug fixes and minor changes (0.3.13 → 0.3.14)
-   - `minor`: New features and non-breaking changes (0.3.13 → 0.4.0)
-   - `major`: Breaking changes (0.3.13 → 1.0.0)
+2. **Create a draft release**:
+   - Go to [Actions](https://github.com/OpenPipe/ART/actions/workflows/create-draft-release.yml)
+   - Click "Run workflow"
+   - Select the version bump type:
+     - `patch`: Bug fixes and minor changes (0.3.13 → 0.3.14)
+     - `minor`: New features and non-breaking changes (0.3.13 → 0.4.0)  
+     - `major`: Breaking changes (0.3.13 → 1.0.0)
 
-2. **Run the version bump script**:
-
-   ```bash
-   python scripts/bump_version.py patch  # or minor/major
-   ```
-
-3. **Commit and tag the version**:
-
-   ```bash
-   git add pyproject.toml
-   git commit -m "Bump version to X.Y.Z"
-   git tag vX.Y.Z
-   git push origin main vX.Y.Z
-   ```
-
-4. **GitHub Actions will automatically**:
-
-   - Create a GitHub release with auto-generated notes listing all merged PRs
-   - Build and publish the package to PyPI
-
-5. **Update release notes** (recommended):
+3. **Edit the draft release notes**:
    - Go to the [releases page](https://github.com/OpenPipe/ART/releases)
-   - Click "Edit" on the latest release
-   - Add highlights, breaking changes, or other important information
-   - The auto-generated PR list provides a good starting point, but manual curation improves clarity
+   - Click "Edit" on the draft release
+   - Add release highlights, breaking changes, and curated changelog
+   - The auto-generated PR list provides a starting point, but manual curation improves clarity
+
+4. **Finalize the release**:
+   - Review and merge the automatically created release PR
+   - This will automatically:
+     - Create the git tag
+     - Publish the curated release notes
+     - Build and publish the package to PyPI
 
 Then follow the SkyPilot or Local Training instructions below.
 

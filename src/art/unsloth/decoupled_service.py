@@ -1,31 +1,31 @@
 import asyncio
-from collections import Counter
-from datasets import Dataset
-from dataclasses import dataclass
-from functools import cached_property
 import gc
 import logging
 import os
-import peft
 import time
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils.dummy_pt_objects import PreTrainedModel, GenerationMixin
+from collections import Counter
+from dataclasses import dataclass
+from functools import cached_property
+from typing import Any, AsyncIterator, cast
+
+import peft
 import torch
+from datasets import Dataset
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.utils.dummy_pt_objects import GenerationMixin, PreTrainedModel
 from trl import GRPOConfig, GRPOTrainer
-from typing import AsyncIterator, cast, Any
 from vllm import AsyncEngineArgs
 from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.lora.request import LoRARequest
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.worker.gpu_worker import logger
 
-from .. import dev
-from ..local.pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
-from .. import types
-from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
+from .. import dev, types
+from ..local.checkpoints import get_last_checkpoint_dir
+from ..local.pack import DiskPackedTensors, PackedTensors, packed_tensors_from_dir
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..local.checkpoints import get_last_checkpoint_dir
+from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
 from .train import train
 
 
@@ -38,6 +38,7 @@ class CausalLM(PreTrainedModel, GenerationMixin):
 class TrainInputs(PackedTensors):
     config: types.TrainConfig
     _config: dev.TrainConfig
+    return_new_logprobs: bool
 
 
 @dataclass
@@ -124,10 +125,30 @@ class DecoupledUnslothService:
             warmup = True
         else:
             warmup = False
-
+        precalculate_logprobs = _config.get("precalculate_logprobs", False)
         # Train on the batch
         for offset in range(0, packed_tensors["tokens"].shape[0]):
             for _ in range(2 if warmup else 1):
+                if precalculate_logprobs and not warmup:
+                    packed_tensors["logprobs"] = torch.cat(
+                        [
+                            self._state.trainer.compute_loss(
+                                self._state.peft_model,
+                                TrainInputs(
+                                    **{
+                                        k: v[_offset : _offset + 1]
+                                        for k, v in packed_tensors.items()
+                                        if isinstance(v, torch.Tensor)
+                                    },
+                                    config=config,
+                                    _config=_config,
+                                    return_new_logprobs=True,
+                                ),  # type: ignore
+                            )
+                            for _offset in range(0, packed_tensors["tokens"].shape[0])
+                        ]
+                    ).to("cpu")
+                    precalculate_logprobs = False
                 self._state.inputs_queue.put_nowait(
                     TrainInputs(
                         **{
@@ -147,6 +168,7 @@ class DecoupledUnslothService:
                             else config
                         ),
                         _config=_config,
+                        return_new_logprobs=False,
                     )
                 )
                 # Wait for a result from the queue or for the training task to,
