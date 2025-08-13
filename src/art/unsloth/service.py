@@ -1,16 +1,16 @@
 import asyncio
-from dataclasses import dataclass
 import functools
 import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, AsyncIterator
+
 import torch
-from typing import AsyncIterator, TYPE_CHECKING
 
 from art.utils.get_model_step import get_step_from_dir
 
-from .. import dev
-from .. import types
+from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
-from ..local.pack import DiskPackedTensors, packed_tensors_from_dir, PackedTensors
+from ..local.pack import DiskPackedTensors, PackedTensors, packed_tensors_from_dir
 from .train import train
 
 if TYPE_CHECKING:
@@ -100,6 +100,7 @@ class UnslothService:
             for offset in range(0, packed_tensors["tokens"].shape[0]):
                 for _ in range(2 if warmup else 1):
                     if precalculate_logprobs and not warmup:
+                        packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
                         packed_tensors["logprobs"] = torch.cat(
                             [
                                 self.state.trainer.compute_loss(

@@ -1,11 +1,12 @@
 """OpenAI-compatible server functionality for vLLM."""
 
 import asyncio
-from contextlib import asynccontextmanager
 import logging
-from openai import AsyncOpenAI
 import os
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Coroutine
+
+from openai import AsyncOpenAI
 from uvicorn.config import LOGGING_CONFIG
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
@@ -32,9 +33,9 @@ async def openai_server_task(
     """
     # Import patches before importing api_server
     from .patches import (
-        subclass_chat_completion_request,
         patch_listen_for_disconnect,
         patch_tool_parser_manager,
+        subclass_chat_completion_request,
     )
 
     # We must subclass ChatCompletionRequest before importing api_server
@@ -45,6 +46,23 @@ async def openai_server_task(
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
     set_vllm_log_file(config.get("log_file", "vllm.log"))
+
+    # Patch engine.add_lora; hopefully temporary
+    add_lora = engine.add_lora
+
+    async def _add_lora(lora_request) -> None:
+        class LoRARequest:
+            def __getattr__(self, name: str) -> Any:
+                if name == "lora_tensors" and not hasattr(lora_request, name):
+                    return None
+                return getattr(lora_request, name)
+
+            def __setattr__(self, name: str, value: Any) -> None:
+                setattr(lora_request, name, value)
+
+        await add_lora(LoRARequest())  # type: ignore
+
+    engine.add_lora = _add_lora
 
     @asynccontextmanager
     async def build_async_engine_client(
@@ -71,7 +89,7 @@ async def openai_server_task(
 
     test_client_task = asyncio.create_task(test_client())
     try:
-        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 10.0))
+        timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 30.0))
         done, _ = await asyncio.wait(
             [openai_server_task, test_client_task],
             timeout=timeout,
