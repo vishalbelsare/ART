@@ -10,7 +10,7 @@ import art
 
 trainable_models = {
     "001": art.TrainableModel(
-        name="overfitting-001",
+        name="overfitting-001-4",
         project="overfitting_experiments",
         base_model="Qwen/Qwen2.5-3B-Instruct",
         _internal_config=art.dev.InternalModelConfig(
@@ -27,6 +27,13 @@ parser.add_argument(
     type=str,
     required=True,
     help="Comma-separated list of model keys to train (e.g. 001,002,003).",
+)
+parser.add_argument(
+    "--experiment",
+    type=str,
+    choices=["yes_no_maybe", "essay_topics", "life_coaching", "tic_tac_toe"],
+    default="yes_no_maybe",
+    help="Which experiment to run (yes_no_maybe, essay_topics, life_coaching, or tic_tac_toe).",
 )
 parser.add_argument(
     "--use-cluster-name",
@@ -53,7 +60,10 @@ def launch_model(model_key: str):
     trainable_model = trainable_models[model_key]
     print(f"Launching {model_key} on SkyPilot…")
 
-    model_json = json.dumps(trainable_model.model_dump())
+    # Update model name to include experiment type
+    model_dict = trainable_model.model_dump()
+    model_dict["name"] = f"{model_dict['name']}-{args.experiment}"
+    model_json = json.dumps(model_dict)
 
     setup_script = textwrap.dedent(
         """
@@ -78,7 +88,7 @@ def launch_model(model_key: str):
         uv add --editable ~/ART --extra backend --extra plotting
 
         echo '{model_json}' > model_config.json
-        uv run yes_no_maybe.py
+        uv run {args.experiment}.py
     """
     )
 
