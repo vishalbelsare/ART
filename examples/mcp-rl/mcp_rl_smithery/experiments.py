@@ -44,12 +44,22 @@ models: dict[str, art.TrainableModel[McpPolicyConfig]] = {
         name="mcp-nws-14b-001",
         project="mcp-smithery",
         base_model="Qwen/Qwen2.5-14B-Instruct",
+        init_args=art.dev.InitArgs(
+            max_seq_length=16384,
+        ),
         config=McpPolicyConfig(
             num_epochs=160,
             smithery_mcp_url=urls["nws"],
+            # trajectories_per_group=2,
+            # groups_per_step=1,
         ),
     ),
 }
+
+# uv run python -m run_remote --cluster-name pubmed --cancel-all mcp_rl_smithery.train --model mcp-pubmed-14b-002
+models["mcp-pubmed-14b-002"] = models["mcp-nws-14b-001"].model_copy(deep=True)
+models["mcp-pubmed-14b-002"].name = "mcp-pubmed-14b-002"
+
 
 # uv run python -m run_remote --cluster-name pubmed --cancel-all mcp_rl_smithery.train --model mcp-pubmed-14b-001
 models["mcp-pubmed-14b-001"] = models["mcp-nws-14b-001"].model_copy(deep=True)

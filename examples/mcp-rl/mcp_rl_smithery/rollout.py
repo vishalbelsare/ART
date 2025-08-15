@@ -210,6 +210,12 @@ async def rollout(
                                 }
                             )
                         else:
+                            # check if tool_call.function.name is in tool_names
+                            if tool_call.function.name not in tool_names:
+                                raise Exception(
+                                    f"Tool {tool_call.function.name} not found in tool_names"
+                                )
+
                             # 🔧 Call MCP tool through remote Smithery session
                             result = await call_mcp_tool(
                                 scenario.smithery_mcp_url,

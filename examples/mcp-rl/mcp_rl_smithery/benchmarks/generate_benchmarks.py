@@ -39,6 +39,7 @@ async def generate_val_groups(
     return groups
 
 
+@weave.op()
 async def calculate_beat_comp(
     groups: list[art.TrajectoryGroup],
     control_groups: list[art.TrajectoryGroup],
