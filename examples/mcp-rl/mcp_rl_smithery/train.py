@@ -69,7 +69,9 @@ async def train_mcp_agent(model: art.TrainableModel, use_skypilot: bool = False)
         from art.skypilot.backend import SkyPilotBackend
 
         backend = await SkyPilotBackend().initialize_cluster(
-            cluster_name="mcp-smithery", gpu="H100-SXM"
+            cluster_name="mcp-smithery",
+            gpu="H100-SXM",
+            env_path="../../.env",
         )
     else:
         from art.local.backend import LocalBackend

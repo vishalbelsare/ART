@@ -15,7 +15,6 @@ from servers.python.mcp_balldontlie.server_params import (
 )
 
 import art
-from art.local import LocalBackend
 from art.rewards.ruler import ruler_score_group
 
 from ..rollout import SmitheryMcpScenario, rollout
@@ -23,9 +22,6 @@ from ..rollout import SmitheryMcpScenario, rollout
 load_dotenv()
 
 random.seed(42)
-
-# Initialize the server
-backend = LocalBackend()
 
 
 async def generate_val_groups(
@@ -100,6 +96,7 @@ async def calculate_beat_comp(
 
 
 async def log_comparison_model(
+    backend: art.Backend,
     comparison_model: art.Model,
     val_scenarios: List[SmitheryMcpScenario],
     control_groups: list[art.TrajectoryGroup] | None = None,
@@ -122,6 +119,8 @@ async def log_comparison_model(
 
 
 async def run_benchmarks(server: str = "mcp_alphavantage"):
+    from art.local import LocalBackend
+
     if server == "mcp_alphavantage":
         scenarios_path = "servers/python/mcp_alphavantage/scenarios/val.jsonl"
         server_params = alphavantage_server_params
@@ -134,6 +133,8 @@ async def run_benchmarks(server: str = "mcp_alphavantage"):
         )
 
     weave.init(server)
+
+    backend = LocalBackend()
 
     # comparison models
     gpt_4o_mini = art.Model(
@@ -206,7 +207,9 @@ async def run_benchmarks(server: str = "mcp_alphavantage"):
         o4_mini,
         sonnet_4,
     ]:
-        await log_comparison_model(comparison_model, val_scenarios, control_groups)
+        await log_comparison_model(
+            backend, comparison_model, val_scenarios, control_groups
+        )
 
 
 if __name__ == "__main__":

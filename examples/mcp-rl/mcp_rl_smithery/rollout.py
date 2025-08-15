@@ -40,7 +40,7 @@ class SmitheryMcpScenario:
 async def rollout(
     model: art.Model,
     scenario: SmitheryMcpScenario,
-    debug: bool = False,
+    debug: bool = True,
 ) -> art.Trajectory:
     """Run an MCP agent rollout against the remote Smithery MCP server."""
     traj = art.Trajectory(
@@ -60,7 +60,8 @@ async def rollout(
         scenario.smithery_mcp_url
     )
     tool_names = [t.name for t in tools_result.tools]
-    print(f"rollout: discovered {len(tool_names)} tools: {tool_names}")
+    if debug:
+        print(f"rollout: discovered {len(tool_names)} tools: {tool_names}")
 
     # Convert to OpenAI tool format
     tool_schemas = []
@@ -126,16 +127,18 @@ async def rollout(
             last_user = next(
                 (m for m in reversed(traj.messages()) if m["role"] == "user"), None
             )
-            print(
-                f"\nLLM request - step: {num_turns}, model: {model.inference_model_name or model.name}, "
-                f"tools: {len(tool_schemas)}, last_user: {last_user['content'][:160] + '...' if last_user else None}"
-            )
+            if debug:
+                print(
+                    f"\nLLM request - step: {num_turns}, model: {model.inference_model_name or model.name}, "
+                    f"tools: {len(tool_schemas)}, last_user: {last_user['content'][:160] + '...' if last_user else None}"
+                )
 
             # Get LLM response
             async with traj.track_duration("llm_completion"):
                 openai_client = AsyncOpenAI(
                     api_key=model.inference_api_key,
                     base_url=model.inference_base_url,
+                    timeout=30.0,  # Add timeout to prevent hanging connections
                 )
 
                 # We also log the request body (without huge params)
@@ -146,7 +149,8 @@ async def rollout(
                     "messages_len": len(traj.messages()),
                     "tools_len": len(tool_schemas),
                 }
-                print(f"LLM request (preview): {req_preview}")
+                if debug:
+                    print(f"LLM request (preview): {req_preview}")
 
                 response = await openai_client.chat.completions.create(
                     model=model.inference_model_name
@@ -154,8 +158,12 @@ async def rollout(
                     else model.name,
                     messages=traj.messages(),
                     tools=tool_schemas,
-                    max_completion_tokens=8000,
+                    max_completion_tokens=4000,
+                    timeout=None,
                 )
+
+                # Explicitly close the client to prevent connection leaks
+                await openai_client.close()
 
             # === Log response ===
             choice = response.choices[0]
@@ -168,10 +176,11 @@ async def rollout(
                 if isinstance(msg.content, str) and msg.content
                 else str(msg.content)[:200]
             )
-            print(
-                f"LLM response parsed - finish_reason: {finish_reason}, "
-                f"has_tool_calls: {has_tools}, content_preview: {content_preview}"
-            )
+            if debug:
+                print(
+                    f"LLM response parsed - finish_reason: {finish_reason}, "
+                    f"has_tool_calls: {has_tools}, content_preview: {content_preview}"
+                )
 
             traj.messages_and_choices.append(choice)
 
@@ -179,10 +188,11 @@ async def rollout(
             if msg.tool_calls:
                 for tool_call in msg.tool_calls:
                     try:
-                        print(
-                            f"Tool call received - name: {tool_call.function.name}, "
-                            f"raw_args: {tool_call.function.arguments}"
-                        )
+                        if debug:
+                            print(
+                                f"Tool call received - name: {tool_call.function.name}, "
+                                f"raw_args: {tool_call.function.arguments}"
+                            )
                         tool_args = json.loads(tool_call.function.arguments or "{}")
 
                         if tool_call.function.name == "complete_task":
@@ -208,18 +218,20 @@ async def rollout(
                             )
 
                             content_text = get_content_text(result)
-                            print(
-                                f"Tool result - name: {tool_call.function.name}, "
-                                f"len: {len(content_text)}"
-                            )
+                            if debug:
+                                print(
+                                    f"Tool result - name: {tool_call.function.name}, "
+                                    f"len: {len(content_text)}"
+                                )
 
                             if len(content_text) > 20000:
-                                # print(
-                                #     f"Tool call result for {tool_call.function.name} is too long: {len(content_text)}"
-                                # )
-                                # print(f"Args: {tool_args}")
-                                # print(content_text[:1000])
-                                # print(content_text[-1000:])
+                                if debug:
+                                    print(
+                                        f"Tool call result for {tool_call.function.name} is too long: {len(content_text)}"
+                                    )
+                                    print(f"Args: {tool_args}")
+                                    print(content_text[:1000])
+                                    print(content_text[-1000:])
                                 raise Exception(
                                     f"Tool call result for {tool_call.function.name} is too long: {len(content_text)}"
                                 )
@@ -247,9 +259,10 @@ async def rollout(
                         )
             else:
                 # No tool calls — log and continue (RULER will likely give 0)
-                print(
-                    f"LLM returned no tool_calls; skipping tool execution - turn: {num_turns}"
-                )
+                if debug:
+                    print(
+                        f"LLM returned no tool_calls; skipping tool execution - turn: {num_turns}"
+                    )
                 # You can consider breaking here or letting it try another turn
                 # break
 
