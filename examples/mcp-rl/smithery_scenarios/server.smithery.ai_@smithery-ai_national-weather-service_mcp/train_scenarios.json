@@ -1,0 +1,66 @@
+[
+  {
+    "task": "Check the hourly weather forecast for Phoenix, AZ, for the next 12 hours, specifically to determine temperature peaks and suggest best times for outdoor exercise.",
+    "difficulty": 2
+  },
+  {
+    "task": "Analyze the hourly forecast for Boston, MA, over the upcoming 48 hours to identify optimal travel windows avoiding significant precipitation and severe weather.",
+    "difficulty": 4
+  },
+  {
+    "task": "Get the weather forecast for Puerto Rico for the upcoming 7 days, analyze potential storm alerts, and prepare a risk mitigation plan for local schools planning field trips.",
+    "difficulty": 4
+  },
+  {
+    "task": "Identify weather stations near Denver, CO, within a 20 km radius, then collect and analyze their recent temperature readings to provide an overview of local climate variations.",
+    "difficulty": 4
+  },
+  {
+    "task": "Get a multi-day forecast for New Orleans, LA, during festival days, then review active weather alerts to compile a detailed safety and planning report for event organizers.",
+    "difficulty": 4
+  },
+  {
+    "task": "Check current weather conditions and alerts for coastal waters near Cape Cod, MA, and provide a safety briefing for commercial and recreational boaters.",
+    "difficulty": 3
+  },
+  {
+    "task": "Check for any active weather alerts in Texas and summarize their severity, coverage areas, and potential impacts on transportation across the state.",
+    "difficulty": 3
+  },
+  {
+    "task": "Determine local times and current weather conditions across multiple US territories (Puerto Rico, Guam, American Samoa), then provide a cohesive briefing for a multinational company's remote teams.",
+    "difficulty": 4
+  },
+  {
+    "task": "Obtain hourly weather forecasts for the next 24 hours in Chicago, IL, analyze the chances of rain in the afternoon, and recommend the safest time frame for a business outdoor event.",
+    "difficulty": 3
+  },
+  {
+    "task": "Obtain hourly forecasts for the next 36 hours in Minneapolis, MN, and create a detailed report focusing on wind speed and precipitation probabilities relevant to planned outdoor construction work.",
+    "difficulty": 4
+  },
+  {
+    "task": "Retrieve the current weather conditions in Miami, FL, and generate a brief summary along with insights on how it might affect outdoor plans today.",
+    "difficulty": 1
+  },
+  {
+    "task": "Find weather stations near Guam, retrieve their recent alert statuses, and evaluate the frequency and severity of extreme weather events for infrastructure assessment.",
+    "difficulty": 5
+  },
+  {
+    "task": "Compile a report for a cross-country road trip: retrieve and summarize daily forecasts and current alerts for stops in Miami, Atlanta, Nashville, St. Louis, and Denver to optimize travel safety and comfort.",
+    "difficulty": 5
+  },
+  {
+    "task": "Produce a 7-day forecast for New York City, NY, then cross-reference it with any active weather alerts in the area and deliver a risk assessment report for outdoor tourists.",
+    "difficulty": 4
+  },
+  {
+    "task": "Generate the current weather and local time in Washington, DC, then prepare a combined briefing for an international conference participant adjusting to time zone and weather conditions.",
+    "difficulty": 2
+  },
+  {
+    "task": "Retrieve current weather conditions in San Francisco, CA, and compare them with the previous 7-day forecast to evaluate forecast accuracy and potential implications for local businesses.",
+    "difficulty": 5
+  }
+]

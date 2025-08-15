@@ -1,0 +1,34 @@
+[
+  {
+    "task": "Generate a summary of current weather alerts for the entire state of Florida, filter them by severity to focus on extreme and severe alerts, and provide recommendations for emergency preparedness.",
+    "difficulty": 3
+  },
+  {
+    "task": "Find all active weather alerts for Alaska's Aleutian Islands and summarize the alert types and their expected duration to aid local fishing communities in preparation.",
+    "difficulty": 3
+  },
+  {
+    "task": "Get a 5-day weather forecast for Seattle, WA, and provide a detailed report highlighting the best days for hiking based on temperature and precipitation probability.",
+    "difficulty": 2
+  },
+  {
+    "task": "Analyze hourly weather forecasts over 48 hours for Chicago, IL, and Indianapolis, IN, to compare precipitation patterns and advise on best scheduling for a regional sports tournament.",
+    "difficulty": 5
+  },
+  {
+    "task": "Determine the local time in Anchorage, AK, and combine this information with the current weather conditions to prepare a comprehensive briefing for remote workers scheduled to start their shift now.",
+    "difficulty": 2
+  },
+  {
+    "task": "Find weather observation stations around Honolulu, HI, and assess the reliability of their data by comparing their last 24 hours of weather reports to the general hourly forecast for the area.",
+    "difficulty": 5
+  },
+  {
+    "task": "For a state-wide agricultural conference in Kansas, gather current weather data, forecasts for the next 3 days, and any severe weather alerts to prepare a comprehensive weather outlook presentation.",
+    "difficulty": 4
+  },
+  {
+    "task": "Locate the 15 nearest weather stations to Salt Lake City, UT, gather their latest data, and analyze spatial weather pattern differences across the region to assist in agricultural planning.",
+    "difficulty": 5
+  }
+]

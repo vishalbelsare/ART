@@ -155,7 +155,6 @@ async def rollout(
                     messages=traj.messages(),
                     tools=tool_schemas,
                     max_completion_tokens=8000,
-                    tool_choice="required",
                 )
 
             # === Log response ===
