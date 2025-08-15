@@ -1,0 +1,34 @@
+[
+  {
+    "task": "Search for articles by the author 'Sarah Johnson' on autoimmune diseases, gather metadata for 10 articles, and create a comprehensive summary and critique of her research trends.",
+    "difficulty": 4
+  },
+  {
+    "task": "Find articles related to 'AI ethics in healthcare' through keyword search, summarize key discussions from 10 articles, and prepare a reasoned analysis and report on ethical challenges and recommendations.",
+    "difficulty": 4
+  },
+  {
+    "task": "Search PubMed by keyword for articles on ketogenic diets, retrieve metadata for the top 8 results, and create a summary highlighting dietary impacts on metabolic health.",
+    "difficulty": 3
+  },
+  {
+    "task": "Identify and download PDFs of the seminal articles on 'epigenetics and cancer,' summarize their key findings, and prepare a report on the evolution of this research area.",
+    "difficulty": 5
+  },
+  {
+    "task": "Search for articles mentioning 'CRISPR gene editing' and generate a concise summary highlighting the main advancements and challenges discussed.",
+    "difficulty": 2
+  },
+  {
+    "task": "Perform a keyword search for studies related to diabetes treatments published in the last five years, download PDFs of the most cited articles, and prepare a detailed comparative analysis.",
+    "difficulty": 5
+  },
+  {
+    "task": "Find and download the full text PDFs of articles studying the impact of air pollution on asthma, then summarize the main conclusions and public health implications.",
+    "difficulty": 4
+  },
+  {
+    "task": "Identify recent breakthroughs in antibiotic resistance research by searching for relevant keywords, download selected PDFs, and generate a comprehensive analysis and summary report.",
+    "difficulty": 5
+  }
+]

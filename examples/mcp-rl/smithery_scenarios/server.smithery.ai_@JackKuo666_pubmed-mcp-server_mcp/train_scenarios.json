@@ -1,0 +1,66 @@
+[
+  {
+    "task": "Conduct an advanced search for clinical trial reports on new antiviral drugs published between 2019 and 2024, retrieve metadata for relevant articles, and provide an exhaustive review and summary.",
+    "difficulty": 5
+  },
+  {
+    "task": "Search for the latest 10 research articles on Alzheimer's disease and generate a summary report analyzing the recent trends and findings.",
+    "difficulty": 2
+  },
+  {
+    "task": "Locate articles published in 'The Lancet' during 2020 concerning the use of telemedicine, retrieve metadata and PDFs for select articles, and produce an evaluative summary of telemedicine's impact during the pandemic.",
+    "difficulty": 5
+  },
+  {
+    "task": "Use keyword search to find recently published studies on 'microbiome and obesity,' retrieve metadata for top results, download PDFs, and develop a detailed analysis and summary.",
+    "difficulty": 5
+  },
+  {
+    "task": "Use advanced search to find research articles on the effect of exercise on mental health, extract metadata for 10 articles, and produce a summary report analyzing the methodologies used.",
+    "difficulty": 3
+  },
+  {
+    "task": "Using advanced search, find articles authored by 'Michael Lee' focusing on cardiovascular diseases, download corresponding PDFs, and write a detailed review of his research findings.",
+    "difficulty": 5
+  },
+  {
+    "task": "Conduct an advanced search for articles with the term 'stem cell therapy' published between 2015 and 2020, collect metadata on the top 10 articles, and summarize the clinical trial outcomes discussed.",
+    "difficulty": 4
+  },
+  {
+    "task": "Perform an advanced search for articles authored by 'John Smith' on the topic of gene therapy published between 2018 and 2023, retrieve metadata of the top 5 articles, and prepare a detailed analysis and summary.",
+    "difficulty": 4
+  },
+  {
+    "task": "Using keyword search, find articles related to COVID-19 vaccine efficacy, retrieve metadata for the top 15 results, and compile a comprehensive summary comparing the different vaccine candidates.",
+    "difficulty": 4
+  },
+  {
+    "task": "Conduct an advanced search for articles published in the journal 'Nature Medicine' in 2022 on cancer immunotherapy, retrieve metadata for the top 10 articles, download the PDFs of the top 3, and create a thorough review and analysis.",
+    "difficulty": 5
+  },
+  {
+    "task": "Search PubMed for articles containing the keywords 'machine learning' and 'biomedical imaging,' retrieve and analyze the metadata of top results, then summarize trends in the application of AI techniques for medical diagnostics.",
+    "difficulty": 4
+  },
+  {
+    "task": "Perform a keyword search for articles on 'mental health interventions in adolescents,' generate summaries for the top 10 studies found, and analyze varying treatment approaches and outcomes.",
+    "difficulty": 3
+  },
+  {
+    "task": "Search for reviews on 'physical therapy and stroke recovery,' compile metadata from the top 10 articles, download PDFs, and generate an in-depth synthesis and report of therapeutic efficacy.",
+    "difficulty": 4
+  },
+  {
+    "task": "Search for articles containing keywords related to 'nanotechnology in drug delivery,' extract metadata of 10 articles, and provide a critical analysis and summary report.",
+    "difficulty": 4
+  },
+  {
+    "task": "Identify and download the PDF of a specific article given its PMID, then summarize the key points and provide an in-depth report of the study's implications.",
+    "difficulty": 3
+  },
+  {
+    "task": "Find articles authored by 'Emily Chen' that focus on neurodegenerative diseases, retrieve metadata, and create a report summarizing her contributions to the field.",
+    "difficulty": 3
+  }
+]
