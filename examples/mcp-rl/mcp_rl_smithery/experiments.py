@@ -44,8 +44,10 @@ models: dict[str, art.TrainableModel[McpPolicyConfig]] = {
         name="mcp-nws-14b-001",
         project="mcp-smithery",
         base_model="Qwen/Qwen2.5-14B-Instruct",
-        init_args=art.dev.InitArgs(
-            max_seq_length=16384,
+        _internal_config=art.dev.InternalModelConfig(
+            init_args=art.dev.InitArgs(
+                max_seq_length=16384,
+            ),
         ),
         config=McpPolicyConfig(
             num_epochs=160,
