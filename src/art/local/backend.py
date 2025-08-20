@@ -9,11 +9,11 @@ from typing import AsyncIterator, Literal, cast
 
 import aiohttp
 import numpy as np
-from openai import AsyncOpenAI
 import polars as pl
 import torch
 import wandb
 import weave
+from openai import AsyncOpenAI
 from tqdm import auto as tqdm
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -485,9 +485,9 @@ class LocalBackend(Backend):
             num_gradient_steps = int(
                 result.pop("num_gradient_steps", estimated_gradient_steps)
             )
-            assert (
-                num_gradient_steps == estimated_gradient_steps
-            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
+            assert num_gradient_steps == estimated_gradient_steps, (
+                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
+            )
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
