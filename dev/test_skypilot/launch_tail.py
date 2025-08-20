@@ -2,16 +2,16 @@
 
 import asyncio
 
-from art.skypilot.backend import SkyPilotBackend
 from dotenv import load_dotenv
 
+from art.skypilot.backend import SkyPilotBackend
 
 load_dotenv()
 
 
 async def launch_tail():
     backend = await SkyPilotBackend().initialize_cluster(
-        cluster_name="test_launch",
+        cluster_name="test-skypilot",
         gpu="H100-SXM",
         env_path=".env",
         force_restart=True,
