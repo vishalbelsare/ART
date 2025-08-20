@@ -92,10 +92,10 @@ dev-dependencies = [
     "openpipe>=4.49.0",
     "hatch>=1.14.1",
     "ruff>=0.12.1",
-    "pyright>=1.1.403",
     "pytest>=8.4.1",
     "nbval>=0.11.0",
     "pytest-xdist>=3.8.0",
+    "pyright[nodejs]>=1.1.403",
 ]
 
 [tool.uv.sources]
