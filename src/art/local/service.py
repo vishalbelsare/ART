@@ -19,6 +19,8 @@ class ModelService(Protocol):
         self, config: dev.OpenAIServerConfig | None
     ) -> None: ...
 
+    async def vllm_engine_is_sleeping(self) -> bool: ...
+
     def train(
         self,
         disk_packed_tensors: DiskPackedTensors,

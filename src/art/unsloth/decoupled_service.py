@@ -61,6 +61,7 @@ class DecoupledUnslothService:
     base_model: str
     config: dev.InternalModelConfig
     output_dir: str
+    _is_sleeping: bool = False
 
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
         lora_path = get_last_checkpoint_dir(self.output_dir)
@@ -79,6 +80,9 @@ class DecoupledUnslothService:
                 config=config,
             ),
         )
+
+    async def vllm_engine_is_sleeping(self) -> bool:
+        return self._is_sleeping
 
     async def train(
         self,
@@ -108,6 +112,8 @@ class DecoupledUnslothService:
             if set(pids.values()) == {2}:
                 break
             await asyncio.sleep(0.25)
+
+        self._is_sleeping = True
 
         # Free memory after vLLM workers are asleep
         self._free_memory()
@@ -219,6 +225,8 @@ class DecoupledUnslothService:
 
         # wait for the workers to wake up
         await sleep_task
+
+        self._is_sleeping = False
 
         # swap out the LoRA adapter
         await llm.remove_lora(1)

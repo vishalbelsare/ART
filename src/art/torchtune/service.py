@@ -27,6 +27,7 @@ class TorchtuneService:
     base_model: str
     config: dev.InternalModelConfig
     output_dir: str
+    _is_sleeping: bool = False
 
     async def start_openai_server(self, config: dev.OpenAIServerConfig | None) -> None:
         await openai_server_task(
@@ -38,6 +39,9 @@ class TorchtuneService:
                 config=config,
             ),
         )
+
+    async def vllm_engine_is_sleeping(self) -> bool:
+        return self._is_sleeping
 
     async def train(
         self,
@@ -73,6 +77,7 @@ class TorchtuneService:
             if set(pids.values()) == {2}:
                 break
             await asyncio.sleep(0.25)
+        self._is_sleeping = True
         # acquire the train process and queue
         train_process = await self.train_process
         train_queue = await self.train_queue
@@ -110,6 +115,7 @@ class TorchtuneService:
             num_gradient_steps -= 1
         # wait for the workers to wake up
         await sleep_task
+        self._is_sleeping = False
         # update the weights after wake up if async_weight_syncing is enabled
         if async_weight_syncing:
             asyncio.create_task(self.update_worker_weights(llm, weights_path, verbose))
@@ -138,9 +144,9 @@ class TorchtuneService:
     @property
     def torchtune_args(self) -> dev.TorchtuneArgs:
         torchtune_args = self.config.get("torchtune_args")
-        assert torchtune_args is not None, (
-            'TorchtuneService created without config["torchtune_args"]'
-        )
+        assert (
+            torchtune_args is not None
+        ), 'TorchtuneService created without config["torchtune_args"]'
         return torchtune_args
 
     @cached_property

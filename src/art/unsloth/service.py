@@ -71,6 +71,9 @@ class UnslothService:
         )
         self._set_lora(lora_path)
 
+    async def vllm_engine_is_sleeping(self) -> bool:
+        return await self.state.vllm.async_engine.is_sleeping()
+
     async def stop_openai_server(self) -> None:
         if self._openai_server_task:
             self._openai_server_task.cancel()
@@ -164,9 +167,9 @@ class UnslothService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert result is not None, (
-                            "The training task should never finish."
-                        )
+                        assert (
+                            result is not None
+                        ), "The training task should never finish."
                         self.results_queue.task_done()
                         if warmup:
                             from .state import free_memory

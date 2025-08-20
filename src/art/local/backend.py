@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import os
@@ -6,7 +7,9 @@ from datetime import datetime
 from types import TracebackType
 from typing import AsyncIterator, Literal, cast
 
+import aiohttp
 import numpy as np
+from openai import AsyncOpenAI
 import polars as pl
 import torch
 import wandb
@@ -271,7 +274,57 @@ class LocalBackend(Backend):
         base_url = f"http://{server_args.get('host', '0.0.0.0')}:{server_args.get('port', 8000)}/v1"
         api_key = server_args.get("api_key", None) or "default"
 
+        def done_callback(_: asyncio.Task[None]) -> None:
+            close_proxy(self._services.pop(model.name))
+
+        asyncio.create_task(
+            self._monitor_openai_server(model.name, base_url, api_key)
+        ).add_done_callback(done_callback)
+
         return base_url, api_key
+
+    async def _monitor_openai_server(
+        self, model_name: str, base_url: str, api_key: str
+    ) -> None:
+        openai_client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+        )
+        async with aiohttp.ClientSession() as session:
+            while True:
+                # Wait 30 seconds before checking again
+                await asyncio.sleep(30)
+                # If the server is sleeping, skip the check
+                if await self._services[model_name].vllm_engine_is_sleeping():
+                    continue
+                # Check the metrics
+                async with session.get(
+                    f"{base_url.split('/v1')[0]}/metrics"
+                ) as response:
+                    metrics = await response.text()
+                # Parse Prometheus metrics for running requests
+                running_requests = 0
+                pending_requests = 0
+                for line in metrics.split("\n"):
+                    if line.startswith("vllm:num_requests_running"):
+                        running_requests = int(float(line.split()[1]))
+                    elif line.startswith("vllm:num_requests_waiting"):
+                        pending_requests = int(float(line.split()[1]))
+                # If there are no running or pending requests, send a health check
+                if running_requests == 0 and pending_requests == 0:
+                    try:
+                        # Send a health check with a 5 second timeout
+                        await openai_client.completions.create(
+                            model=model_name,
+                            prompt="Hi",
+                            max_tokens=1,
+                            timeout=5,
+                        )
+                    except Exception as e:
+                        # If the server is sleeping, a failed health check is okay
+                        if await self._services[model_name].vllm_engine_is_sleeping():
+                            continue
+                        raise e
 
     async def _log(
         self,
@@ -432,9 +485,9 @@ class LocalBackend(Backend):
             num_gradient_steps = int(
                 result.pop("num_gradient_steps", estimated_gradient_steps)
             )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
+            assert (
+                num_gradient_steps == estimated_gradient_steps
+            ), f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             results.append(result)
             yield {**result, "num_gradient_steps": num_gradient_steps}
             pbar.update(1)
