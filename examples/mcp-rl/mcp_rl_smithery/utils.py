@@ -33,6 +33,59 @@ async def list_tools_and_resources(smithery_mcp_url: str):
         return tools, resources
 
 
+# Cache tools to reduce the number of requests to the server
+cached_tools = {}
+
+
+async def get_mcp_tools(smithery_mcp_url: str, debug: bool = False) -> list[dict]:
+    if smithery_mcp_url in cached_tools:
+        return cached_tools[smithery_mcp_url]
+
+    # Discover available tools from the remote server
+    tools_result, _ = await list_tools_and_resources(smithery_mcp_url)
+    tool_names = [t.name for t in tools_result.tools]
+    if debug:
+        print(f"get_mcp_tools: discovered {len(tool_names)} tools: {tool_names}")
+
+    # Convert to OpenAI tool format
+    tool_schemas = []
+    for tool in tools_result.tools:
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or f"MCP tool: {tool.name}",
+                "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+            },
+        }
+        tool_schemas.append(tool_schema)
+
+    # Add completion tool schema
+    tool_schemas.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "complete_task",
+                "description": "Complete the task with a summary",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Summary of accomplishments",
+                        }
+                    },
+                    "required": ["summary"],
+                },
+            },
+        }
+    )
+
+    cached_tools[smithery_mcp_url] = tool_schemas
+
+    return tool_schemas
+
+
 async def call_mcp_tool(smithery_mcp_url: str, tool_name: str, arguments: dict):
     """Invoke a tool on the remote Smithery server and return the CallToolResult."""
     async with mcp_session(smithery_mcp_url) as session:

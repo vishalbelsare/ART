@@ -1,0 +1,66 @@
+[
+  {
+    "task": "Answer a complex query about the differences between Legendary Pok\u00e9mon from the Hoenn and Sinnoh regions and produce a thorough comparative analysis report.",
+    "difficulty": 5
+  },
+  {
+    "task": "Find a random Pok\u00e9mon and generate a summary of its type-based advantages and disadvantages, along with recommendations for team building.",
+    "difficulty": 3
+  },
+  {
+    "task": "Generate a set of random Grass-type Pok\u00e9mon and prepare a detailed report on their habitats, abilities, and typical combat roles.",
+    "difficulty": 4
+  },
+  {
+    "task": "Find a random Water-type Pok\u00e9mon and provide a detailed description and analysis of its strengths and weaknesses.",
+    "difficulty": 2
+  },
+  {
+    "task": "Retrieve a random Pok\u00e9mon from the Hoenn region and compare its traits and abilities to a similar type Pok\u00e9mon from the Johto region, providing a detailed report.",
+    "difficulty": 4
+  },
+  {
+    "task": "Answer a natural language query asking which Pok\u00e9mon are best suited for water-type battles and provide a summary of the top 3 recommendations.",
+    "difficulty": 3
+  },
+  {
+    "task": "Find 5 random Pok\u00e9mon from different regions and create a report comparing their elemental types and abilities, summarizing notable patterns.",
+    "difficulty": 4
+  },
+  {
+    "task": "Generate a summary of random Pok\u00e9mon whose type includes Psychic, analyzing their common abilities and roles within game strategies.",
+    "difficulty": 4
+  },
+  {
+    "task": "Compile a detailed report on random Flying-type Pok\u00e9mon describing their common attributes, regional variations, and strategic usage.",
+    "difficulty": 4
+  },
+  {
+    "task": "Find random Pok\u00e9mon from the Unova region and prepare a detailed comparative analysis focusing on their statistical strengths and weaknesses.",
+    "difficulty": 4
+  },
+  {
+    "task": "Generate a summary report of 5 random Pok\u00e9mon from the Kanto region, analyzing their type distributions and unique characteristics.",
+    "difficulty": 3
+  },
+  {
+    "task": "Answer a natural language query about the rarity and capture difficulty of various Pok\u00e9mon species and provide a thorough analysis and summary.",
+    "difficulty": 5
+  },
+  {
+    "task": "Select a random Pok\u00e9mon and provide an in-depth summary of its type effectiveness, common movesets, and competitive viability.",
+    "difficulty": 3
+  },
+  {
+    "task": "Retrieve a random Pok\u00e9mon and explain its evolutionary line including strengths and potential battle strategies, then summarize the findings.",
+    "difficulty": 3
+  },
+  {
+    "task": "From the list of random Pok\u00e9mon generated, identify those that have dual types and summarize how their dual-type nature affects battle strategies.",
+    "difficulty": 4
+  },
+  {
+    "task": "Answer an advanced query about the effects of Pok\u00e9mon type combinations on move effectiveness and provide an analytical report with example Pok\u00e9mon.",
+    "difficulty": 5
+  }
+]

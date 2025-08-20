@@ -17,7 +17,12 @@ from openai import AsyncOpenAI
 
 import art
 
-from .utils import call_mcp_tool, get_content_text, list_tools_and_resources
+from .utils import (
+    call_mcp_tool,
+    get_content_text,
+    get_mcp_tools,
+    list_tools_and_resources,
+)
 
 load_dotenv()
 
@@ -46,7 +51,6 @@ async def rollout(
     traj = art.Trajectory(
         messages_and_choices=[],
         reward=0,
-        metadata={"task": scenario.task_description},
         metrics={
             "task_completed": False,
             "success": False,
@@ -55,49 +59,8 @@ async def rollout(
         scenario=scenario,
     )
 
-    # Discover available tools from the remote server
-    tools_result, _resources_result = await list_tools_and_resources(
-        scenario.smithery_mcp_url
-    )
-    tool_names = [t.name for t in tools_result.tools]
-    if debug:
-        print(f"rollout: discovered {len(tool_names)} tools: {tool_names}")
-
-    # Convert to OpenAI tool format
-    tool_schemas = []
-    for tool in tools_result.tools:
-        tool_schema = {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or f"MCP tool: {tool.name}",
-                "parameters": tool.inputSchema or {"type": "object", "properties": {}},
-            },
-        }
-        tool_schemas.append(tool_schema)
-
-    # Add completion tool schema
-    tool_schemas.append(
-        {
-            "type": "function",
-            "function": {
-                "name": "complete_task",
-                "description": "Complete the task with a summary",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "summary": {
-                            "type": "string",
-                            "description": "Summary of accomplishments",
-                        }
-                    },
-                    "required": ["summary"],
-                },
-            },
-        }
-    )
-
-    traj.tools = tool_schemas
+    traj.tools = await get_mcp_tools(scenario.smithery_mcp_url, debug)
+    tool_names = [t["function"]["name"] for t in traj.tools]
 
     # Initialize conversation
     system_prompt = (
@@ -130,34 +93,23 @@ async def rollout(
             if debug:
                 print(
                     f"\nLLM request - step: {num_turns}, model: {model.inference_model_name or model.name}, "
-                    f"tools: {len(tool_schemas)}, last_user: {last_user['content'][:160] + '...' if last_user else None}"
+                    f"tools: {len(traj.tools)}, last_user: {last_user['content'][:160] + '...' if last_user else None}"
                 )
+
+            openai_client = AsyncOpenAI(
+                api_key=model.inference_api_key,
+                base_url=model.inference_base_url,
+                timeout=30.0,  # Add timeout to prevent hanging connections
+            )
 
             # Get LLM response
             async with traj.track_duration("llm_completion"):
-                openai_client = AsyncOpenAI(
-                    api_key=model.inference_api_key,
-                    base_url=model.inference_base_url,
-                    timeout=30.0,  # Add timeout to prevent hanging connections
-                )
-
-                # We also log the request body (without huge params)
-                req_preview = {
-                    "model": model.inference_model_name
-                    if model.inference_model_name
-                    else model.name,
-                    "messages_len": len(traj.messages()),
-                    "tools_len": len(tool_schemas),
-                }
-                if debug:
-                    print(f"LLM request (preview): {req_preview}")
-
                 response = await openai_client.chat.completions.create(
                     model=model.inference_model_name
                     if model.inference_model_name
                     else model.name,
                     messages=traj.messages(),
-                    tools=tool_schemas,
+                    tools=traj.tools,
                     max_completion_tokens=4000,
                     timeout=None,
                 )
@@ -224,23 +176,6 @@ async def rollout(
                             )
 
                             content_text = get_content_text(result)
-                            if debug:
-                                print(
-                                    f"Tool result - name: {tool_call.function.name}, "
-                                    f"len: {len(content_text)}"
-                                )
-
-                            if len(content_text) > 20000:
-                                if debug:
-                                    print(
-                                        f"Tool call result for {tool_call.function.name} is too long: {len(content_text)}"
-                                    )
-                                    print(f"Args: {tool_args}")
-                                    print(content_text[:1000])
-                                    print(content_text[-1000:])
-                                raise Exception(
-                                    f"Tool call result for {tool_call.function.name} is too long: {len(content_text)}"
-                                )
 
                             # Add tool response
                             traj.messages_and_choices.append(
@@ -250,7 +185,6 @@ async def rollout(
                                     "content": content_text,
                                 }
                             )
-
                     except Exception as e:
                         traceback.print_exc()
                         traj.log(f"Tool call error: {e}")

@@ -1,0 +1,34 @@
+[
+  {
+    "task": "Compile a list of random Fire-type Pok\u00e9mon from various regions and produce a comparative analysis report on their base stats and abilities.",
+    "difficulty": 4
+  },
+  {
+    "task": "Get a random Pok\u00e9mon from any region and provide an analysis report covering its typical habitat, abilities, and relevance in the Pok\u00e9mon universe.",
+    "difficulty": 3
+  },
+  {
+    "task": "Answer a question about which Pok\u00e9mon can counter Fire-type Pok\u00e9mon effectively, and provide an analysis including top candidates with reasoning.",
+    "difficulty": 3
+  },
+  {
+    "task": "Get a random Electric-type Pok\u00e9mon, summarize its abilities and typical use cases, and generate an analysis of its effectiveness against common types.",
+    "difficulty": 3
+  },
+  {
+    "task": "Create a summary report of 10 random Pok\u00e9mon from various types and regions, analyzing their popularity and usage in competitive battles based on common queries.",
+    "difficulty": 5
+  },
+  {
+    "task": "Answer a natural language query about the evolution stages of a specific Pok\u00e9mon and provide a comprehensive summary and analysis of its development and battle utility.",
+    "difficulty": 3
+  },
+  {
+    "task": "Get a random Pok\u00e9mon from the Johto region and analyze how its attributes differ from similar types in the Kanto region, providing a detailed report.",
+    "difficulty": 4
+  },
+  {
+    "task": "Using multiple random Pok\u00e9mon from the Sinnoh region, prepare a report analyzing the distribution of their types and how they align with common environmental biomes.",
+    "difficulty": 4
+  }
+]

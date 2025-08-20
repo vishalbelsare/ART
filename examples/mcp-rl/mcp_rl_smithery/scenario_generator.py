@@ -5,10 +5,12 @@ import time
 from collections import Counter
 from typing import Any, Dict, List, Tuple
 import asyncio
+import argparse
 
 import openai
 from dotenv import load_dotenv
 
+from .urls import urls
 from .utils import list_tools_and_resources
 
 load_dotenv()
@@ -253,8 +255,9 @@ def load_scenarios(
 
 
 async def run_generation(
-    smithery_mcp_url: str, num_training_inputs: int = 16, num_test_inputs: int = 8
+    server: str, num_training_inputs: int = 16, num_test_inputs: int = 8
 ):
+    smithery_mcp_url = urls[server]
     expected_total = num_training_inputs + num_test_inputs
 
     info(f"Target total scenarios: {expected_total}")
@@ -313,7 +316,15 @@ async def run_generation(
 
 
 if __name__ == "__main__":
-    smithery_mcp_url = os.getenv("SMITHERY_MCP_URL")
-    if not smithery_mcp_url:
-        raise ValueError("SMITHERY_MCP_URL is not set")
-    asyncio.run(run_generation(smithery_mcp_url=smithery_mcp_url))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--server", type=str, required=True)
+    parser.add_argument("--num_training_inputs", type=int, required=False, default=16)
+    parser.add_argument("--num_test_inputs", type=int, required=False, default=8)
+    args = parser.parse_args()
+    asyncio.run(
+        run_generation(
+            server=args.server,
+            num_training_inputs=args.num_training_inputs,
+            num_test_inputs=args.num_test_inputs,
+        )
+    )

@@ -72,19 +72,15 @@ async def train_mcp_agent(model: art.TrainableModel, use_skypilot: bool = False)
             cluster_name="mcp-smithery",
             gpu="H100-SXM",
             env_path="../../.env",
-            force_restart=True,
+            # force_restart=True,
         )
     else:
         from art.local.backend import LocalBackend
 
         backend = LocalBackend()
 
-    # await backend._experimental_pull_from_s3(
-    #     model,
-    # )
-
-    raise Exception(
-        "An exception raised here stalls the execution, but does not show up in the printed logs"
+    await backend._experimental_pull_from_s3(
+        model,
     )
 
     await model.register(backend)
