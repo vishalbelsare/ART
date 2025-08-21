@@ -3,7 +3,16 @@ import contextlib
 import contextvars
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Iterable, Iterator, Literal, overload
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Literal,
+    overload,
+)
 
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
@@ -18,10 +27,12 @@ async def gather_trajectory_groups(
     pbar_total_completion_tokens: bool = True,
     max_exceptions: int | float = 0,
     max_metrics: int | None = None,
-    after_each: Callable[
-        [TrajectoryGroup], Awaitable[TrajectoryGroup | None | list[TrajectoryGroup]]
-    ]
-    | None = None,
+    after_each: (
+        Callable[
+            [TrajectoryGroup], Awaitable[TrajectoryGroup | None | list[TrajectoryGroup]]
+        ]
+        | None
+    ) = None,
 ) -> list[TrajectoryGroup]:
     groups = list(groups)
     context = GatherContext(
@@ -182,8 +193,7 @@ def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
     ]
     if logprobs:
         trajectory.metrics["completion_tokens"] = sum(
-            len(l.content or l.refusal or [])
-            for l in logprobs  # noqa: E741
+            len(l.content or l.refusal or []) for l in logprobs  # noqa: E741
         ) / len(logprobs)
     context.metric_sums["reward"] += trajectory.reward  # type: ignore
     context.metric_divisors["reward"] += 1
