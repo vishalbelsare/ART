@@ -1,6 +1,5 @@
 # utils.py
 import inspect
-from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import pandas as pd
@@ -9,16 +8,6 @@ from geopy.distance import geodesic
 # ---------------------------
 # Data models
 # ---------------------------
-
-
-@dataclass
-class ParkSpecies:
-    park_name: str
-    park_state: str
-    distance: float  # kilometers
-    species_abundance: str
-    species_nativeness: str
-    species_seasonality: str
 
 
 # ---------------------------
@@ -186,7 +175,18 @@ def args_valid(func, args: dict) -> bool:
 
 async def get_city_location(city: str, state: str) -> Optional[Tuple[float, float]]:
     """
-    Returns [lat, lon] for a given city and state.
+    Retrieves geographic coordinates for a specified U.S. city and state.
+
+    Searches the preloaded cities dataset for an exact match (case-insensitive)
+    of the provided city name and state. Returns the latitude and longitude
+    coordinates if found, or None if the city is not in the dataset.
+
+    Args:
+        city: Name of the city to look up
+        state: Name or abbreviation of the state
+
+    Returns:
+        Tuple of (latitude, longitude) as floats if city found, None otherwise
     """
     result = df_cities[
         (df_cities["city"].str.lower() == city.lower())
@@ -203,10 +203,29 @@ async def get_nearest_parks_with_species(
     long: float,
     species: str,
     max_results: int,
-) -> List[ParkSpecies]:
+) -> List[dict]:
     """
-    Returns nearest parks where a species is present.
-    Filters df_parks_bio for species and computes distances.
+    Finds the nearest national parks containing a specified species.
+
+    Searches the biodiversity dataset for parks where the given species has been
+    observed, calculates the distance from the provided coordinates to each park,
+    and returns the closest parks sorted by distance. Includes detailed species
+    information such as abundance, nativeness, and seasonality data.
+
+    Args:
+        lat: Latitude coordinate of the search origin point
+        long: Longitude coordinate of the search origin point
+        species: Common name of the species to search for (case-insensitive partial match)
+        max_results: Maximum number of parks to return
+
+    Sends back:
+        List of dictionaries containing park information, each with:
+        - park_name: Name of the national park
+        - park_state: State where the park is located
+        - distance: Distance from origin point in kilometers
+        - species_abundance: Abundance level of the species in that park
+        - species_nativeness: Whether species is native or non-native
+        - species_seasonality: Seasonal presence information
     """
     matches = df_parks_bio[
         df_parks_bio["common_name"].str.contains(species, case=False, na=False)
@@ -215,24 +234,24 @@ async def get_nearest_parks_with_species(
     if matches.empty:
         return []
 
-    parks_with_species: List[ParkSpecies] = []
+    parks_with_species: List[dict] = []
 
     for _, row in matches.iterrows():
         park_coords = (row["latitude"], row["longitude"])
         distance_km = geodesic((lat, long), park_coords).kilometers
 
         parks_with_species.append(
-            ParkSpecies(
-                park_name=row["park_name"],
-                park_state=row["State"],
-                distance=distance_km,
-                species_abundance=row.get("Abundance", "Unknown"),
-                species_nativeness=row.get("Nativeness", "Unknown"),
-                species_seasonality=row.get("Seasonality", "Unknown"),
-            )
+            {
+                "park_name": row["park_name"],
+                "park_state": row["State"],
+                "distance": distance_km,
+                "species_abundance": row.get("Abundance", "Unknown"),
+                "species_nativeness": row.get("Nativeness", "Unknown"),
+                "species_seasonality": row.get("Seasonality", "Unknown"),
+            }
         )
 
-    parks_with_species.sort(key=lambda p: p.distance)
+    parks_with_species.sort(key=lambda p: p["distance"])
     return parks_with_species[:max_results]
 
 

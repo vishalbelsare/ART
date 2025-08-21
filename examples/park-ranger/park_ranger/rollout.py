@@ -67,6 +67,8 @@ async def rollout(model: art.Model, scenario: ParkRangerScenario) -> art.Traject
 
     num_turns = 0
 
+    print(traj.tools)
+
     while num_turns < 10:
         num_turns += 1
 
@@ -77,6 +79,8 @@ async def rollout(model: art.Model, scenario: ParkRangerScenario) -> art.Traject
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
         traj.messages_and_choices.append(completion.choices[0])
+
+        print(completion.choices[0].message.tool_calls[0])
 
         valid_tool_names = [t["function"]["name"] for t in traj.tools]
 
@@ -112,6 +116,7 @@ async def rollout(model: art.Model, scenario: ParkRangerScenario) -> art.Traject
                     continue
                 else:
                     result = await tool_func(**args)
+                    print(result)
                     traj.messages_and_choices.append(
                         {
                             "role": "tool",
@@ -135,7 +140,7 @@ if __name__ == "__main__":
         rollout(
             model=model,
             scenario=ParkRangerScenario(
-                request="I'm in New York, NY. Where can I find bears?"
+                request="I'm in Seattle. Where can I find bears?"
             ),
         )
     )
