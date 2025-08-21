@@ -24,6 +24,7 @@ from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import Messages, MessagesAndChoices, Tools, TrainConfig
 from .utils import retry
+from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
 
 __all__ = [
     "dev",
@@ -40,4 +41,6 @@ __all__ = [
     "TrainConfig",
     "Trajectory",
     "TrajectoryGroup",
+    "capture_yielded_trajectory",
+    "yield_trajectory",
 ]
