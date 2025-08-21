@@ -20,12 +20,11 @@ from . import dev
 from .backend import Backend
 from .batches import trajectory_group_batches
 from .gather import gather_trajectories, gather_trajectory_groups
-
 from .model import Model, TrainableModel
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import Messages, MessagesAndChoices, Tools, TrainConfig
 from .utils import retry
-from .with_trajectory import with_trajectory, contextual_trajectory, required_trajectory
+from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
 
 __all__ = [
     "dev",
@@ -42,7 +41,6 @@ __all__ = [
     "TrainConfig",
     "Trajectory",
     "TrajectoryGroup",
-    "with_trajectory",
-    "contextual_trajectory",
-    "required_trajectory",
+    "capture_yielded_trajectory",
+    "yield_trajectory",
 ]
