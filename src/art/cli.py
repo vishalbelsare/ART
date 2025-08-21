@@ -5,6 +5,7 @@ from typing import Any, AsyncIterator
 import pydantic
 import typer
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -12,9 +13,12 @@ from . import dev
 from .errors import ARTError
 from .local import LocalBackend
 from .model import Model, TrainableModel
+
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 from .utils.deploy_model import LoRADeploymentProvider
+
+load_dotenv()
 
 app = typer.Typer()
 
@@ -54,9 +58,14 @@ def run(host: str = "0.0.0.0", port: int = 7999) -> None:
 
     app.get("/healthcheck")(lambda: {"status": "ok"})
     app.post("/close")(backend.close)
-    app.post("/register")(backend.register)
     app.post("/_get_step")(backend._get_step)
     app.post("/_delete_checkpoints")(backend._delete_checkpoints)
+
+    @app.post("/register")
+    async def register(
+        model: Model = Body(...),
+    ):
+        await backend.register(model)
 
     @app.post("/_prepare_backend_for_training")
     async def _prepare_backend_for_training(
