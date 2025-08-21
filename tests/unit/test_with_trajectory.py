@@ -137,8 +137,13 @@ async def test_with_trajectory(test_server: None) -> None:
             model="test",
             messages=[message],
         )
+        # Add optional ART support with a few lines of code
+        if trajectory := art.contextual_trajectory():
+            trajectory.messages_and_choices = [message, chat_completion.choices[0]]
+            trajectory.reward = 1.0
         return chat_completion.choices[0].message.content
 
+    # Use the with_trajectory utility to get a trajectory from the coroutine
     trajectory = await art.with_trajectory(say_hi())
     assert trajectory.messages_and_choices == [
         {"role": "user", "content": "Hi!"},
