@@ -1,0 +1,58 @@
+park_id,park_name,State,Acres,latitude,longitude
+KATMAI,Katmai National Park,Unknown,0,58.58305,-154.88689
+JOSHUA_TREE,Joshua Tree National Park,Unknown,0,33.9529,-116.0089
+ISLE_ROYALE,Isle Royale National Park,Unknown,0,47.9624,-88.8917
+HOT_SPRINGS,Hot Springs National Park,Unknown,0,34.3796,-93.0221
+HAWAII_VOLCANOES,Hawaii Volcanoes National Park,Unknown,0,19.4,-155.3
+HALEAKALA,Haleakala National Park,Unknown,0,20.71063,-156.21039
+GUADALUPE_MOUNTAINS,Guadalupe Mountains National Park,Unknown,0,31.812,-104.8835
+GREAT_SMOKY_MOUNTAINS,Great Smoky Mountains National Park,Unknown,0,35.6536,-83.5469
+GREAT_SAND_DUNES,Great Sand Dunes National Park,Unknown,0,37.75444,-105.55861
+GREAT_BASIN,Great Basin National Park,Unknown,0,38.868,-114.1513
+GRAND_TETON,Grand Teton National Park,Unknown,0,43.9052,-110.3824
+GRAND_CANYON_-_SOUTH_RIM,Grand Canyon - South Rim National Park,Unknown,0,36.06502,-112.11762
+GRAND_CANYON_-_NORTH_RIM,Grand Canyon - North Rim National Park,Unknown,0,36.1632,-113.1975
+GLACIER_BAY,Glacier Bay National Park,Unknown,0,58.41543,-135.75584
+GLACIER,Glacier National Park,Unknown,0,48.616,-113.8672
+GATES_OF_THE_ARCTIC,Gates of the Arctic National Park,Unknown,0,67.64657,-153.2713
+EVERGLADES,Everglades National Park,Unknown,0,25.4028,-80.8934
+DRY_TORTUGAS,Dry Tortugas National Park,Unknown,0,24.6384,-81.7862
+DENALI,Denali National Park,Unknown,0,63.62165,-149.27258
+DEATH_VALLEY,Death Valley National Park,Unknown,0,36.3027,-116.4117
+CUYAHOGA_VALLEY,Cuyahoga Valley National Park,Unknown,0,41.20906,-81.55701
+CRATER_LAKE,Crater Lake National Park,Unknown,0,42.9173,-122.0824
+CONGAREE,Congaree National Park,Unknown,0,33.78333,-80.78333
+CHANNEL_ISLANDS,Channel Islands National Park,Unknown,0,34.0394,-119.7425
+CARLSBAD_CAVERNS,Carlsbad Caverns National Park,Unknown,0,32.1648,-104.4094
+CAPITOL_REEF,Capitol Reef National Park,Unknown,0,37.986,-111.144
+CANYONLANDS,Canyonlands National Park,Unknown,0,38.0252,-109.966
+BRYCE_CANYON,Bryce Canyon National Park,Unknown,0,37.5548,-112.1967
+BLACK_CANYON_OF_THE_GUNNISON,Black Canyon of the Gunnison National Park,Unknown,0,38.58167,-107.7208
+BISCAYNE,Biscayne National Park,Unknown,0,25.442,-80.2619
+BIG_BEND,Big Bend National Park,Unknown,0,29.3816,-103.2432
+BADLANDS,Badlands National Park,Unknown,0,43.6504,-102.4343
+ARCHES,Arches National Park,Unknown,0,38.77,-109.565
+ACADIA,Acadia National Park,Unknown,0,44.454,-68.0493
+KENAI_FJORDS,Kenai Fjords National Park,Unknown,0,59.85136,-150.08632
+KINGS_CANYON,Kings Canyon National Park,Unknown,0,36.8481,-118.3574
+KOBUK_VALLEY,Kobuk Valley National Park,Unknown,0,67.34409,-159.13696
+LAKE_CLARK,Lake Clark National Park,Unknown,0,60.19943,-154.32394
+LASSEN_VOLCANIC,Lassen Volcanic National Park,Unknown,0,40.4579,-121.4461
+MAMMOTH_CAVE,Mammoth Cave National Park,Unknown,0,37.104,-86.1839
+MESA_VERDE,Mesa Verde National Park,Unknown,0,37.1824,-108.3871
+MOUNT_RAINIER,Mount Rainier National Park,Unknown,0,46.7981,-121.4762
+NORTH_CASCADES,North Cascades National Park,Unknown,0,48.4004,-121.0219
+OLYMPIC,Olympic National Park,Unknown,0,47.6948,-123.5455
+PETRIFIED_FOREST,Petrified Forest National Park,Unknown,0,34.8892,-109.7964
+REDWOOD,Redwood National Park,Unknown,0,41.4771,-123.9452
+ROCKY_MOUNTAIN,Rocky Mountain National Park,Unknown,0,40.3576,-105.8307
+SAGUARO,Saguaro National Park,Unknown,0,32.2432,-111.1309
+SEQUOIA,Sequoia National Park,Unknown,0,36.5231,-118.552
+SHENANDOAH,Shenandoah National Park,Unknown,0,38.2604,-78.7041
+THEODORE_ROOSEVELT,Theodore Roosevelt National Park,Unknown,0,47.3352,-103.2491
+VOYAGEURS,Voyageurs National Park,Unknown,0,48.0996,-93.0169
+WIND_CAVE,Wind Cave National Park,Unknown,0,43.4348,-102.8731
+WRANGELL-ST._ELIAS,Wrangell-St. Elias National Park,Unknown,0,61.24284,-143.2166
+YELLOWSTONE,Yellowstone National Park,Unknown,0,44.5716,-110.355
+YOSEMITE,Yosemite National Park,Unknown,0,37.8231,-119.6195
+ZION,Zion National Park,Unknown,0,37.3,-112.9735

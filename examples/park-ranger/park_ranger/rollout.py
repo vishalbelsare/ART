@@ -14,6 +14,8 @@ from park_ranger.utils import (
     args_valid,
     get_city_location,
     get_nearest_parks_with_species,
+    get_nearest_parks,
+    get_species_for_park,
 )
 
 load_dotenv()
@@ -46,6 +48,8 @@ async def rollout(model: art.Model, scenario: ParkRangerScenario) -> art.Traject
     tool_funcs = [
         get_city_location,
         get_nearest_parks_with_species,
+        get_nearest_parks,
+        get_species_for_park,
     ]
 
     traj.tools = [convert_to_openai_tool(t) for t in tool_funcs]  # type: ignore
@@ -67,63 +71,67 @@ async def rollout(model: art.Model, scenario: ParkRangerScenario) -> art.Traject
 
     num_turns = 0
 
-    print(traj.tools)
-
     while num_turns < 10:
         num_turns += 1
 
-        completion = await client.chat.completions.create(
-            model=model.name if model.trainable else model.inference_model_name,
-            messages=traj.messages(),
-            tools=traj.tools,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
+        try:
+            completion = await client.chat.completions.create(
+                model=model.name if model.trainable else model.inference_model_name,
+                messages=traj.messages(),
+                tools=traj.tools,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+        except Exception as e:
+            print()
+            print(traj.messages())
+            print()
+            raise e
+
         traj.messages_and_choices.append(completion.choices[0])
 
         print(completion.choices[0].message.tool_calls[0])
 
-        valid_tool_names = [t["function"]["name"] for t in traj.tools]
+        valid_tool_call = False
 
-        if (
-            len(completion.choices[0].message.tool_calls) == 0
-            or completion.choices[0].message.tool_calls[0].function.name
-            not in valid_tool_names
-        ):
+        if "answer_user" in [
+            t.function.name for t in completion.choices[0].message.tool_calls
+        ]:
+            break
+
+        for tool_call in completion.choices[0].message.tool_calls:
+            args = json.loads(tool_call.function.arguments)
+
+            for tool_func in tool_funcs:
+                if tool_call.function.name == tool_func.__name__:
+                    if not args_valid(tool_func, args):
+                        traj.messages_and_choices.append(
+                            {
+                                "role": "tool",
+                                "content": "Invalid arguments.",
+                                "tool_call_id": tool_call.id,
+                            }
+                        )
+                        continue
+                    else:
+                        valid_tool_call = True
+                        result = await tool_func(**args)
+                        print(result)
+                        traj.messages_and_choices.append(
+                            {
+                                "role": "tool",
+                                "content": json.dumps(result),
+                                "tool_call_id": tool_call.id,
+                            }
+                        )
+
+        if not valid_tool_call:
             traj.messages_and_choices.append(
                 {
                     "role": "user",
-                    "content": f"Please call a valid tool. Must be one of: {', '.join(valid_tool_names)}",
+                    "content": "Please call a valid tool.",
                 }
             )
             continue
-
-        tool_call = completion.choices[0].message.tool_calls[0]
-        args = json.loads(tool_call.function.arguments)
-
-        if tool_call.function.name == "answer_user":
-            break
-
-        for tool_func in tool_funcs:
-            if tool_call.function.name == tool_func.__name__:
-                if not args_valid(tool_func, args):
-                    traj.messages_and_choices.append(
-                        {
-                            "role": "tool",
-                            "content": "Invalid arguments.",
-                            "tool_call_id": tool_call.id,
-                        }
-                    )
-                    continue
-                else:
-                    result = await tool_func(**args)
-                    print(result)
-                    traj.messages_and_choices.append(
-                        {
-                            "role": "tool",
-                            "content": json.dumps(result),
-                            "tool_call_id": tool_call.id,
-                        }
-                    )
 
     return traj
 
@@ -140,11 +148,11 @@ if __name__ == "__main__":
         rollout(
             model=model,
             scenario=ParkRangerScenario(
-                request="I'm in Seattle. Where can I find bears?"
+                request="I'm in Seattle. What interesting wildlife can I find near me?"
             ),
         )
     )
 
     print(traj.metrics)
 
-    print(traj.messages()[-1]["content"])
+    print(traj.messages()[-1]["tool_calls"][0]["function"]["arguments"])
