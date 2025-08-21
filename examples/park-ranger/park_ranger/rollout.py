@@ -11,11 +11,14 @@ import art
 from park_ranger.scenarios import ParkRangerScenario
 from park_ranger.utils import (
     answer_user_tool,
+    args_valid,
     get_city_location,
     get_nearest_parks_with_species,
 )
 
 load_dotenv()
+
+os.environ["WEAVE_LOG_LEVEL"] = "CRITICAL"
 
 
 @weave.op
@@ -40,12 +43,12 @@ async def rollout(model: art.Model, scenario: ParkRangerScenario) -> art.Traject
     {scenario.request}
     """
 
-    tools = [
+    tool_funcs = [
         get_city_location,
         get_nearest_parks_with_species,
     ]
 
-    traj.tools = [convert_to_openai_tool(t) for t in tools]  # type: ignore
+    traj.tools = [convert_to_openai_tool(t) for t in tool_funcs]  # type: ignore
 
     traj.tools.append(answer_user_tool)
 
@@ -75,42 +78,47 @@ async def rollout(model: art.Model, scenario: ParkRangerScenario) -> art.Traject
         )
         traj.messages_and_choices.append(completion.choices[0])
 
-        if len(completion.choices[0].message.tool_calls) == 0:
+        valid_tool_names = [t["function"]["name"] for t in traj.tools]
+
+        if (
+            len(completion.choices[0].message.tool_calls) == 0
+            or completion.choices[0].message.tool_calls[0].function.name
+            not in valid_tool_names
+        ):
             traj.messages_and_choices.append(
                 {
                     "role": "user",
-                    "content": "Please respond with a tool call.",
+                    "content": f"Please call a valid tool. Must be one of: {', '.join(valid_tool_names)}",
                 }
             )
             continue
 
         tool_call = completion.choices[0].message.tool_calls[0]
-        args = json.loads(tool_call["args"])
+        args = json.loads(tool_call.function.arguments)
 
-        if tool_call["name"] == "answer_user":
+        if tool_call.function.name == "answer_user":
             break
 
-        if tool_call["name"] == "get_city_location":
-            city_location = await get_city_location(args["city"], args["state"])
-
-            traj.messages_and_choices.append(
-                {
-                    "role": "tool",
-                    "content": json.dumps(city_location),
-                }
-            )
-
-        if tool_call["name"] == "get_nearest_parks_with_species":
-            parks_with_species = await get_nearest_parks_with_species(
-                args["lat"], args["long"], args["species"], args["max_results"]
-            )
-
-            traj.messages_and_choices.append(
-                {
-                    "role": "tool",
-                    "content": json.dumps(parks_with_species),
-                }
-            )
+        for tool_func in tool_funcs:
+            if tool_call.function.name == tool_func.__name__:
+                if not args_valid(tool_func, args):
+                    traj.messages_and_choices.append(
+                        {
+                            "role": "tool",
+                            "content": "Invalid arguments.",
+                            "tool_call_id": tool_call.id,
+                        }
+                    )
+                    continue
+                else:
+                    result = await tool_func(**args)
+                    traj.messages_and_choices.append(
+                        {
+                            "role": "tool",
+                            "content": json.dumps(result),
+                            "tool_call_id": tool_call.id,
+                        }
+                    )
 
     return traj
 
@@ -119,6 +127,7 @@ if __name__ == "__main__":
     model = art.Model(
         name="gpt-4o-mini",
         project="nearest-wildlife",
+        inference_model_name="openai/gpt-4o-mini",
         inference_api_key=os.getenv("OPENROUTER_API_KEY"),
         inference_base_url="https://openrouter.ai/api/v1",
     )

@@ -1,5 +1,5 @@
 [project]
-name = "nearest-wildlife"
+name = "park-ranger"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -10,6 +10,7 @@ dependencies = [
     "beautifulsoup4>=4.13.4",
     "click>=8.1.8",
     "feedparser>=6.0.11",
+    "geopy>=2.4.1",
     "langchain-core>=0.3.74",
     "lxml>=6.0.0",
     "lxml-html-clean>=0.4.2",
@@ -28,7 +29,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["just_the_facts*"]
+include = ["park_ranger*"]
 
 [tool.uv.sources]
 openpipe-art = { path = "../../", editable = true }
