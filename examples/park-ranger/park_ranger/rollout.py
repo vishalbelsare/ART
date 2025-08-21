@@ -13,8 +13,8 @@ from park_ranger.utils import (
     answer_user_tool,
     args_valid,
     get_city_location,
-    get_nearest_parks_with_species,
     get_nearest_parks,
+    get_nearest_parks_with_species,
     get_species_for_park,
 )
 

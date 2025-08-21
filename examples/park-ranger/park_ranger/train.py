@@ -5,8 +5,10 @@ import weave
 from dotenv import load_dotenv
 
 import art
+from art.rewards.ruler import ruler_score_group
 from art.utils import iterate_dataset
 from park_ranger.experiments import ParkRangerConfig, models
+from park_ranger.generate_benchmarks import calculate_beat_comp, generate_val_groups
 from park_ranger.rollout import rollout
 from park_ranger.scenarios import train_scenarios, val_scenarios
 
@@ -15,6 +17,14 @@ load_dotenv()
 os.environ["WEAVE_LOG_LEVEL"] = "CRITICAL"
 
 weave.init(project_name="park-ranger")
+
+gpt_4_1 = art.Model(
+    name="openai/gpt-4.1",
+    project="park-ranger",
+    inference_model_name="openai/gpt-4.1",
+    inference_api_key=os.environ["OPENROUTER_API_KEY"],
+    inference_base_url="https://openrouter.ai/api/v1",
+)
 
 
 async def train(
@@ -56,42 +66,48 @@ async def train(
         initial_step=await model.get_step(),
     )
 
+    control_groups = await generate_val_groups(gpt_4_1, val_scenarios)
+
+    # Main training loop using iterate_dataset
     for batch in train_iterator:
-        if batch.step % model.config.eval_steps == 0:
-            print(f"\n--- Evaluating at Iteration {batch.step} ---")
+        print("Gathering trajectory groups with RULER scoring...")
 
-            val_groups = await art.gather_trajectory_groups(
-                (
-                    art.TrajectoryGroup(
-                        (
-                            rollout(model, scenario)
-                            for _ in range(model.config.trajectories_per_group)
-                        )
-                    )
-                    for scenario in val_scenarios
-                ),
-            )
-
-            await model.log(val_groups, split="val")
-
+        # Use gather_trajectory_groups with ruler_score_group
         groups = await art.gather_trajectory_groups(
             (
                 art.TrajectoryGroup(
-                    (
-                        rollout(model, scenario)
-                        for _ in range(model.config.trajectories_per_group)
-                    )
+                    rollout(model, scenario, False)
+                    for _ in range(model.config.trajectories_per_group)
                 )
                 for scenario in batch.items
             ),
+            pbar_desc=f"train gather step {batch.step}",
+            after_each=lambda group: ruler_score_group(
+                group,
+                judge_model="openai/o4-mini",
+                debug=True,  # Show judge reasoning
+                swallow_exceptions=True,
+            ),
         )
 
+        print("train groups finished")
+
+        if batch.step % model.config.eval_steps == 0:
+            print("starting comparison val gather")
+            val_groups = await generate_val_groups(model, val_scenarios)
+            await calculate_beat_comp(val_groups, control_groups, control_first=True)
+            await calculate_beat_comp(val_groups, control_groups, control_first=False)
+
+            await model.log(val_groups, split="val")
+
+        print("starting train")
         await model.train(
-            groups,
-            config=art.TrainConfig(learning_rate=model.config.learning_rate),
+            groups, config=art.TrainConfig(learning_rate=model.config.learning_rate)
         )
 
-        await backend._experimental_push_to_s3(model)
+        await backend._experimental_push_to_s3(
+            model,
+        )
 
     print("Training finished.")
 
