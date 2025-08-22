@@ -128,7 +128,7 @@ async def test_server():
     await runner.cleanup()
 
 
-async def test_with_trajectory(test_server: None) -> None:
+async def test_yield_trajectory(test_server: None) -> None:
     async def say_hi() -> str | None:
         """A method that says hi to an assistant and returns the response."""
         client = AsyncOpenAI(base_url="http://localhost:8888/v1", api_key="default")
