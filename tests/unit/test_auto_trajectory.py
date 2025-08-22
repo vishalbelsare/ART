@@ -1,3 +1,12 @@
+import warnings
+
+# Suppress pydantic warnings at module level
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="pydantic")
+
+import litellm
+import litellm.litellm_core_utils.streaming_handler
+import litellm.types.utils
+import pytest
 import pytest_asyncio
 from aiohttp import web
 from openai import AsyncOpenAI
@@ -6,6 +15,7 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 
 import art
+from art.utils.litellm import convert_litellm_choice_to_openai
 
 mock_response = {
     "id": "chatcmpl-293ce9f37dba40e5be39448acaf6fb49",
@@ -308,3 +318,78 @@ async def test_auto_trajectory(test_server: None) -> None:
         mock_stream_choice,
     ]
     assert trajectory.additional_histories[2].tools == tools
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning:pydantic")
+async def test_litellm_auto_trajectory(test_server: None) -> None:
+    message: ChatCompletionMessageParam = {"role": "user", "content": "Hi!"}
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "description": "Get the current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        }
+    ]
+
+    async def say_hi() -> str | None:
+        """A method that says hi to an assistant and returns the response."""
+        response = await litellm.acompletion(
+            model="openai/test",
+            messages=[message],
+            tools=tools,
+            base_url="http://localhost:8888/v1",
+        )
+        assert isinstance(response, litellm.types.utils.ModelResponse)
+        choice = convert_litellm_choice_to_openai(response.choices[0])
+        # follow up message
+        response = await litellm.acompletion(
+            model="openai/test",
+            messages=[
+                message,
+                {"role": "assistant", "content": choice.message.content},
+                message,
+            ],
+            tools=tools,
+            base_url="http://localhost:8888/v1",
+        )
+        assert isinstance(response, litellm.types.utils.ModelResponse)
+        choice = convert_litellm_choice_to_openai(response.choices[0])
+        # another call with tool_choice="required" & stream=True
+        stream = await litellm.acompletion(
+            model="openai/test",
+            messages=[message],
+            tool_choice="required",
+            tools=tools,
+            stream=True,
+            base_url="http://localhost:8888/v1",
+        )
+        assert isinstance(
+            stream, litellm.litellm_core_utils.streaming_handler.CustomStreamWrapper
+        )
+        async for _ in stream:
+            pass
+        # Add ART support with a couple lines of optional code
+        if trajectory := art.auto_trajectory():
+            trajectory.reward = 1.0
+        return choice.message.content
+
+    # Use the capture_auto_trajectory utility to capture a trajectory automatically
+    trajectory = await art.capture_auto_trajectory(say_hi())
+    assert trajectory.messages_and_choices == [
+        message,
+        Choice(**mock_response["choices"][0]),
+        message,
+        Choice(**mock_response["choices"][0]),
+    ]
+    assert trajectory.additional_histories[0].messages_and_choices == [
+        message,
+        mock_stream_choice,
+    ]
+    assert trajectory.additional_histories[0].tools == tools
