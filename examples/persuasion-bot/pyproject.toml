@@ -8,6 +8,7 @@ dependencies = [
     "aiohttp>=3.12.14",
     "asyncio>=3.4.3",
     "beautifulsoup4>=4.13.4",
+    "brotli>=1.1.0",
     "click>=8.1.8",
     "langchain-core>=0.3.74",
     "lxml>=6.0.0",

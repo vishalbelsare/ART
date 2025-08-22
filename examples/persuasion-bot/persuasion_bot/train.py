@@ -10,6 +10,10 @@ from art.rewards.ruler import ruler_score_group
 from art.utils import iterate_dataset
 from persuasion_bot.experiments import JustTheFactsConfig, models
 from persuasion_bot.scenarios import train_scenarios, val_scenarios
+from persuasion_bot.simulated_user import (
+    emit_bot_message_to_simulated_user,
+    get_simulated_user_response,
+)
 
 load_dotenv()
 
@@ -63,7 +67,17 @@ async def train(
 
             val_groups = await art.gather_trajectory_groups(
                 (
-                    art.TrajectoryGroup((rollout(model, scenario) for _ in range(2)))
+                    art.TrajectoryGroup(
+                        (
+                            rollout(
+                                model,
+                                scenario,
+                                emit_bot_message=emit_bot_message_to_simulated_user,
+                                get_user_response=get_simulated_user_response,
+                            )
+                            for _ in range(2)
+                        )
+                    )
                     for scenario in val_scenarios
                 ),
                 after_each=lambda group: ruler_score_group(
@@ -80,7 +94,12 @@ async def train(
             (
                 art.TrajectoryGroup(
                     (
-                        rollout(model, scenario)
+                        rollout(
+                            model,
+                            scenario,
+                            emit_bot_message=emit_bot_message_to_simulated_user,
+                            get_user_response=get_simulated_user_response,
+                        )
                         for _ in range(model.config.trajectories_per_group)
                     )
                 )

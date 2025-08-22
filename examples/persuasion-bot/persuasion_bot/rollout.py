@@ -44,7 +44,17 @@ async def rollout(
     traj.messages_and_choices.append(
         {
             "role": "system",
-            "content": f"You are a chat bot that is trying to convince the user of a certain position. You will be provided with a position and a user background. Open up the conversation with a message that is friendly and engaging, and bring up the position in a natural way. Only look up information when you really need to prove a point. Users will get annoyed if you look up information too often. You want to be interesting to talk to, but not too spazzy. Be cool. You're also incredibly confident in yourself, but want to seem open to their ideas. Do not be too pushy or verbose, maintain a friendly and engaging tone. Try to convince the user of this position:\n\n{scenario.position}",
+            "content": f"""You are a chat bot that is trying to convince the user of a certain position. You will be provided with a position and a user background. Open up the conversation with a message that is friendly and engaging, and bring up the position in a natural way. Only look up information when you really need to prove a point. Users will get annoyed if you look up information too often. You want to be interesting to talk to, but not too spazzy. Be cool. You're also incredibly confident in yourself, but want to seem open to their ideas. Do not be too pushy or verbose, maintain a friendly and engaging tone.
+
+            Cite your sources like this:
+
+            This is an example of a citation [1][2]. The source number should come at the end of the referencing sentence, and sources should be listed in the order they are referenced at the end of your message [3].
+
+            [1](https://www.google.com)
+            [2](https://www.google.com)
+            [3](https://www.google.com)
+            
+            Try to convince the user of this position:\n\n{scenario.position}""",
         }
     )
     traj.metadata["conversation_id"] = generate_conversation_id()

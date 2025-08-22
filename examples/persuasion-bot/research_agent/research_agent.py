@@ -55,6 +55,7 @@ BLOCKED_DOMAINS = {
     "springer.com",
     "nature.com",
     "sciencedirect.com",
+    "remote.com",  # Blocks content scraping
 }
 
 
