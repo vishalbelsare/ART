@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from collections import defaultdict
 from typing import List, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -25,6 +26,16 @@ sonnet_4 = art.Model(
     inference_base_url="https://openrouter.ai/api/v1",
 )
 
+gemini_2_5_flash = art.Model(
+    name="gemini-2.5-flash-research-agent",
+    project="persuasion-bot",
+    inference_model_name="google/gemini-2.5-flash",
+    inference_api_key=os.getenv("OPENROUTER_API_KEY"),
+    inference_base_url="https://openrouter.ai/api/v1",
+)
+
+research_agent_model = gemini_2_5_flash
+
 client = AsyncOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
     base_url="https://openrouter.ai/api/v1",
@@ -32,13 +43,24 @@ client = AsyncOpenAI(
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Domains that commonly block scraping - skip these for faster performance
+BLOCKED_DOMAINS = {
+    "researchgate.net",
+    "academia.edu",
+    "jstor.org",
+    "springer.com",
+    "nature.com",
+    "sciencedirect.com",
+}
 
 
 async def search_brave(query: str, count: int = 10) -> List[dict]:
     """Search using Brave Search API."""
+    start_time = time.time()
     logger.info(f"Starting Brave search for query: '{query}' (count: {count})")
 
     api_key = os.getenv("BRAVE_SEARCH_API_KEY")
@@ -55,37 +77,47 @@ async def search_brave(query: str, count: int = 10) -> List[dict]:
             if response.status == 200:
                 data = await response.json()
                 results = data.get("web", {}).get("results", [])
+                elapsed = time.time() - start_time
                 logger.info(
-                    f"Brave search returned {len(results)} results for query: '{query}'"
+                    f"Brave search returned {len(results)} results for query: '{query}' in {elapsed:.2f}s"
                 )
                 return results
             else:
+                elapsed = time.time() - start_time
                 logger.error(
-                    f"Brave Search API error: {response.status} for query: '{query}'"
+                    f"Brave Search API error: {response.status} for query: '{query}' after {elapsed:.2f}s"
                 )
                 raise Exception(f"Brave Search API error: {response.status}")
 
 
-async def scrape_content(url: str, max_retries: int = 3) -> str:
+async def scrape_content(url: str, max_retries: int = 2) -> str:
     """Scrape text content from a webpage with improved headers and retry logic."""
+    start_time = time.time()
     logger.info(f"Starting to scrape content from: {url}")
+
+    # Skip known problematic domains to save time
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc.lower()
+    if any(blocked in domain for blocked in BLOCKED_DOMAINS):
+        logger.info(f"Skipping known blocked domain: {domain}")
+        return ""
 
     # Rotate through different user agents
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
     ]
 
     for attempt in range(max_retries):
         try:
             # Create session with improved configuration
-            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
-            timeout = aiohttp.ClientTimeout(total=15, connect=10)
-            
+            connector = aiohttp.TCPConnector(limit=10, limit_per_host=3)
+            timeout = aiohttp.ClientTimeout(total=5, connect=3)
+
             async with aiohttp.ClientSession(
-                connector=connector, 
+                connector=connector,
                 timeout=timeout,
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -97,29 +129,27 @@ async def scrape_content(url: str, max_retries: int = 3) -> str:
                     "Sec-Fetch-Dest": "document",
                     "Sec-Fetch-Mode": "navigate",
                     "Sec-Fetch-Site": "none",
-                    "Cache-Control": "max-age=0"
-                }
+                    "Cache-Control": "max-age=0",
+                },
             ) as session:
-                
                 headers = {
                     "User-Agent": user_agents[attempt % len(user_agents)],
-                    "Referer": "https://www.google.com/"
+                    "Referer": "https://www.google.com/",
                 }
-                
+
                 logger.info(f"Attempt {attempt + 1}/{max_retries} for {url}")
-                
+
                 async with session.get(
-                    url, 
-                    headers=headers, 
-                    allow_redirects=True,
-                    max_redirects=10
+                    url, headers=headers, allow_redirects=True, max_redirects=10
                 ) as response:
                     if response.status == 200:
                         html = await response.text()
                         soup = BeautifulSoup(html, "html.parser")
 
                         # Remove script and style elements
-                        for script in soup(["script", "style", "nav", "footer", "header"]):
+                        for script in soup(
+                            ["script", "style", "nav", "footer", "header"]
+                        ):
                             script.decompose()
 
                         # Get text content
@@ -128,52 +158,70 @@ async def scrape_content(url: str, max_retries: int = 3) -> str:
                         # Clean up whitespace
                         lines = (line.strip() for line in text.splitlines())
                         chunks = (
-                            phrase.strip() for line in lines for phrase in line.split("  ")
+                            phrase.strip()
+                            for line in lines
+                            for phrase in line.split("  ")
                         )
                         text = " ".join(chunk for chunk in chunks if chunk)
 
                         # Limit text length
                         final_text = text[:3000] if len(text) > 3000 else text
+                        elapsed = time.time() - start_time
                         logger.info(
-                            f"Successfully scraped {len(final_text)} characters from {url} on attempt {attempt + 1}"
+                            f"Successfully scraped {len(final_text)} characters from {url} on attempt {attempt + 1} in {elapsed:.2f}s"
                         )
 
                         if not final_text.strip():
                             logger.warning(f"Scraped content is empty for {url}")
 
                         return final_text
-                    
-                    elif response.status in [403, 429]:
-                        logger.warning(f"Failed to scrape {url}: HTTP {response.status} on attempt {attempt + 1}")
+
+                    elif response.status == 403:
+                        logger.warning(
+                            f"403 Forbidden for {url} on attempt {attempt + 1} - skipping retries (likely blocked)"
+                        )
+                        break  # Don't retry 403s, they rarely succeed
+                    elif response.status == 429:
+                        logger.warning(
+                            f"429 Rate Limited for {url} on attempt {attempt + 1}"
+                        )
                         if attempt < max_retries - 1:
-                            # Exponential backoff for rate limiting
-                            delay = (2 ** attempt) + (attempt * 0.5)
+                            # Shorter backoff for rate limiting
+                            delay = 1 + (
+                                attempt * 0.5
+                            )  # 1s, 1.5s instead of exponential
                             logger.info(f"Waiting {delay:.1f}s before retry...")
                             await asyncio.sleep(delay)
                             continue
                     else:
-                        logger.warning(f"Failed to scrape {url}: HTTP {response.status} on attempt {attempt + 1}")
+                        logger.warning(
+                            f"Failed to scrape {url}: HTTP {response.status} on attempt {attempt + 1}"
+                        )
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.5)  # Shorter delay for other errors
                             continue
-                        
+
         except asyncio.TimeoutError:
             logger.warning(f"Timeout scraping {url} on attempt {attempt + 1}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)  # Shorter delay for timeouts
                 continue
         except Exception as e:
             logger.error(f"Error scraping {url} on attempt {attempt + 1}: {e}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)  # Shorter delay for errors
                 continue
-    
-    logger.warning(f"Failed to scrape {url} after {max_retries} attempts")
+
+    elapsed = time.time() - start_time
+    logger.warning(
+        f"Failed to scrape {url} after {max_retries} attempts in {elapsed:.2f}s"
+    )
     return ""
 
 
 async def extract_facts_with_ai(content: str, url: str, instructions: str) -> List[str]:
     """Use AI to extract relevant facts from scraped content."""
+    start_time = time.time()
     logger.info(f"Starting fact extraction for {url} (content length: {len(content)})")
 
     if not content.strip():
@@ -197,13 +245,16 @@ async def extract_facts_with_ai(content: str, url: str, instructions: str) -> Li
     try:
         logger.info(f"Sending content to AI for fact extraction from {url}")
         response = await client.chat.completions.create(
-            model=sonnet_4.inference_model_name,
+            model=research_agent_model.inference_model_name,
             messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=2000,
+            max_completion_tokens=1000,
         )
 
         response_content = response.choices[0].message.content
-        logger.info(f"AI response for {url}: {response_content[:200]}...")
+        elapsed = time.time() - start_time
+        logger.info(
+            f"AI response for {url}: {response_content[:200]}... (took {elapsed:.2f}s)"
+        )
 
         facts = []
 
@@ -217,10 +268,11 @@ async def extract_facts_with_ai(content: str, url: str, instructions: str) -> Li
                 if fact:
                     facts.append(fact)
 
-        logger.info(f"Extracted {len(facts)} facts from {url}")
+        logger.info(f"Extracted {len(facts)} facts from {url} in {elapsed:.2f}s")
         return facts[:3]  # Limit to 3 facts per source
     except Exception as e:
-        logger.error(f"Error extracting facts from {url}: {e}")
+        elapsed = time.time() - start_time
+        logger.error(f"Error extracting facts from {url} after {elapsed:.2f}s: {e}")
         return []
 
 
@@ -241,6 +293,9 @@ async def find_supporting_facts(
     Returns:
         A list of tuples, where each tuple contains a fact and the URL of the source.
     """
+    overall_start_time = time.time()
+    timings = defaultdict(float)
+
     logger.info(f"Starting research with instructions: {instructions}")
     logger.info(f"User facing message: {user_facing_message}")
 
@@ -248,17 +303,31 @@ async def find_supporting_facts(
     query_prompt = f"""
     Based on these research instructions: {instructions}
     
-    Generate 2-3 specific search queries that would help find relevant information. Make the queries specific and focused.
+    Generate 2-3 simple, effective search queries that would find relevant information. 
+    
+    Guidelines:
+    - Use simple, common terms that people actually search for
+    - Avoid quotes, complex phrases, or too many specific terms
+    - Focus on the main topic and 1-2 key aspects per query
+    - Make queries that would return actual results on search engines
+    
     Return each query on a separate line starting with "QUERY: ".
+    
+    Examples of good queries:
+    QUERY: electric vehicle charging stations 2024
+    QUERY: EV charging infrastructure growth
+    QUERY: electric car charging time improvements
     """
 
     try:
+        query_gen_start = time.time()
         logger.info("Generating search queries with AI")
         response = await client.chat.completions.create(
-            model=sonnet_4.inference_model_name,
+            model=research_agent_model.inference_model_name,
             messages=[{"role": "user", "content": query_prompt}],
             max_completion_tokens=1000,
         )
+        timings["query_generation"] += time.time() - query_gen_start
 
         queries = []
         response_content = response.choices[0].message.content
@@ -287,17 +356,21 @@ async def find_supporting_facts(
         queries = [fallback_query]
 
     all_facts = []
+    all_content_for_extraction = []  # Store (content, url) pairs for parallel fact extraction
 
-    # Search and scrape for each query
-    for query in queries[:2]:  # Limit to 2 queries to avoid rate limits
+    # Process all queries in parallel
+    logger.info(f"Processing {len(queries[:2])} queries in parallel")
+    search_start = time.time()
+    
+    async def process_query(query):
+        """Process a single query and return all valid content."""
         logger.info(f"Processing query: '{query}'")
         try:
-            # Search Brave
             search_results = await search_brave(query, count=5)
 
             if not search_results:
                 logger.warning(f"No search results for query: '{query}'")
-                continue
+                return []
 
             # Process top results
             tasks = []
@@ -315,7 +388,8 @@ async def find_supporting_facts(
                 )
                 contents = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Extract facts from each scraped content
+                # Collect valid content for later parallel fact extraction
+                query_content = []
                 for i, content in enumerate(contents):
                     if isinstance(content, Exception):
                         logger.error(f"Exception during scraping: {content}")
@@ -323,23 +397,66 @@ async def find_supporting_facts(
 
                     if isinstance(content, str) and content:
                         url = valid_urls[i]
-                        facts = await extract_facts_with_ai(content, url, instructions)
-                        for fact in facts:
-                            all_facts.append((fact, url))
-                            logger.info(f"Added fact from {url}: {fact[:100]}...")
+                        query_content.append((content, url))
                     else:
                         logger.warning(
                             f"No content scraped from {valid_urls[i] if i < len(valid_urls) else 'unknown URL'}"
                         )
+                return query_content
             else:
                 logger.warning(f"No valid URLs found for query: '{query}'")
+                return []
 
         except Exception as e:
             logger.error(f"Error processing query '{query}': {e}")
-            continue
+            return []
 
-        # Add small delay between queries
-        await asyncio.sleep(1)
+    # Process all queries concurrently
+    query_tasks = [process_query(query) for query in queries[:2]]
+    query_results = await asyncio.gather(*query_tasks, return_exceptions=True)
+    
+    # Combine search and scraping timing
+    search_scrape_time = time.time() - search_start
+    timings["search"] += search_scrape_time * 0.3  # Rough estimate for search portion
+    timings["scraping"] += search_scrape_time * 0.7  # Rough estimate for scraping portion
+
+    # Flatten all content from all queries
+    for result in query_results:
+        if isinstance(result, Exception):
+            logger.error(f"Exception in query processing: {result}")
+            continue
+        if isinstance(result, list):
+            all_content_for_extraction.extend(result)
+
+    # Extract facts from all content in parallel
+    if all_content_for_extraction:
+        logger.info(f"Extracting facts from {len(all_content_for_extraction)} pieces of content in parallel")
+        fact_extract_start = time.time()
+        
+        # Create parallel fact extraction tasks
+        fact_extraction_tasks = [
+            extract_facts_with_ai(content, url, instructions)
+            for content, url in all_content_for_extraction
+        ]
+        
+        # Execute all fact extractions concurrently
+        fact_results = await asyncio.gather(*fact_extraction_tasks, return_exceptions=True)
+        
+        timings["fact_extraction"] += time.time() - fact_extract_start
+        
+        # Process results
+        for i, facts in enumerate(fact_results):
+            if isinstance(facts, Exception):
+                logger.error(f"Exception during fact extraction: {facts}")
+                continue
+            
+            if isinstance(facts, list):
+                content, url = all_content_for_extraction[i]
+                for fact in facts:
+                    all_facts.append((fact, url))
+                    logger.info(f"Added fact from {url}: {fact[:100]}...")
+    else:
+        logger.warning("No content available for fact extraction")
 
     # Remove duplicates and limit results
     logger.info(f"Starting deduplication process with {len(all_facts)} total facts")
@@ -353,9 +470,36 @@ async def find_supporting_facts(
         else:
             logger.debug(f"Skipped duplicate fact: {fact[:50]}...")
 
+    # Calculate timing summary
+    total_elapsed = time.time() - overall_start_time
+
     logger.info(
         f"Research completed: Found {len(unique_facts)} unique facts from {len(all_facts)} total facts"
     )
+
+    # Print detailed timing statistics
+    logger.info("=" * 60)
+    logger.info("RESEARCH PERFORMANCE STATISTICS")
+    logger.info("=" * 60)
+    logger.info(f"Total research time: {total_elapsed:.2f}s")
+    logger.info(
+        f"Query generation time: {timings['query_generation']:.2f}s ({timings['query_generation'] / total_elapsed * 100:.1f}%)"
+    )
+    logger.info(
+        f"Search API calls time: {timings['search']:.2f}s ({timings['search'] / total_elapsed * 100:.1f}%)"
+    )
+    logger.info(
+        f"Web scraping time: {timings['scraping']:.2f}s ({timings['scraping'] / total_elapsed * 100:.1f}%)"
+    )
+    logger.info(
+        f"AI fact extraction time: {timings['fact_extraction']:.2f}s ({timings['fact_extraction'] / total_elapsed * 100:.1f}%)"
+    )
+
+    other_time = total_elapsed - sum(timings.values())
+    logger.info(
+        f"Other processing time: {other_time:.2f}s ({other_time / total_elapsed * 100:.1f}%)"
+    )
+    logger.info("=" * 60)
 
     if unique_facts:
         logger.info("Final facts:")

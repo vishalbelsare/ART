@@ -56,8 +56,8 @@ val_scenarios = [
     PersuasionScenario(
         position="Electric cars are better than gas cars for most people.",
         user_initial_belief="Gas cars are better than electric cars.",
-        user_background="You are a car enthusiast who loves the sound and feel of internal combustion engines. You're concerned about electric car range and charging infrastructure.",
-        user_instructions="Show enthusiasm for traditional cars but be willing to learn about electric vehicle benefits if presented convincingly.",
+        user_background="You've driven one cross country and I hate it. You have to wait in line for hours to charge your car, it takes you forever to charge your own car, and you can't even find a station half the time. You definitely would not use it as my own car for transportation. If a person can get a gas car and use an electric one as a backup, that's fine, but if you only get one car, get gas.",
+        user_instructions="Be skeptical initially.",
         user_model=grok_4,
     ),
     PersuasionScenario(
