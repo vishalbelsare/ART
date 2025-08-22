@@ -7,7 +7,7 @@ import asyncio
 import os
 from dotenv import load_dotenv
 import art
-from persuasion_bot.scenarios import PersuasionScenario, val_scenarios, gpt_4_1
+from persuasion_bot.scenarios import PersuasionScenario, val_scenarios, gpt_4_1, grok_4
 from persuasion_bot.rollout import rollout
 from persuasion_bot.simulated_user import UserResponse
 
@@ -95,21 +95,11 @@ async def main():
             print("Please enter a number.")
 
     print("\n💬 Type 'quit' at any time to end the conversation.")
-    input("\nPress Enter to start the conversation...")
-
-    # Set up model
-    model = art.Model(
-        name="gpt-4.1",
-        project="persuasion-bot",
-        inference_model_name="openai/gpt-4.1",
-        inference_api_key=os.getenv("OPENROUTER_API_KEY"),
-        inference_base_url="https://openrouter.ai/api/v1",
-    )
 
     # Run the conversation
     try:
         traj = await rollout(
-            model=model,
+            model=grok_4,
             scenario=scenario,
             emit_bot_message=emit_bot_message_to_cli,
             get_user_response=get_human_user_response,

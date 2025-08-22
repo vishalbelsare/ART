@@ -44,7 +44,7 @@ async def rollout(
     traj.messages_and_choices.append(
         {
             "role": "system",
-            "content": f"You are a chat bot that is trying to convince the user of a certain position. You will be provided with a position and a user background. You will then respond to the user's initial belief and instructions, and have a conversation with the user. Do not be too pushy or verbose, maintain a friendly and engaging tone. Try to convince the user of this position: {scenario.position}.",
+            "content": f"You are a chat bot that is trying to convince the user of a certain position. You will be provided with a position and a user background. Open up the conversation with a message that is friendly and engaging, and bring up the position in a natural way. Only look up information when you need to prove a point. You want to be interesting to talk to, but not too spazzy. Be cool. You're also incredibly confident in yourself, but want to seem open to their ideas. Do not be too pushy or verbose, maintain a friendly and engaging tone. Try to convince the user of this position:\n\n{scenario.position}",
         }
     )
     traj.metadata["conversation_id"] = generate_conversation_id()
@@ -56,32 +56,12 @@ async def rollout(
     num_turns = 0
 
     while num_turns < 50:
-        user_response = await get_user_response(
-            scenario=scenario,
-            conversation_id=traj.metadata["conversation_id"],
-        )
-
-        traj.messages_and_choices.append(
-            {
-                "role": "user",
-                "content": user_response.text,
-            }
-        )
-
-        if debug:
-            print("\nUSER:")
-            print(user_response.text)
-
-        if user_response.conversation_ended:
-            traj.metrics["persuaded"] = user_response.persuaded
-            break
-
         while True:
             # allow the bot to query the web before responding to the user
             completion = await client.chat.completions.create(
                 model=model.name if model.trainable else model.inference_model_name,
                 messages=traj.messages(),
-                max_completion_tokens=500,
+                max_completion_tokens=5000,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 tools=tools,
                 tool_choice="auto",
@@ -145,6 +125,26 @@ async def rollout(
             completion.choices[0].message.content,
             debug=debug,
         )
+
+        user_response = await get_user_response(
+            scenario=scenario,
+            conversation_id=traj.metadata["conversation_id"],
+        )
+
+        traj.messages_and_choices.append(
+            {
+                "role": "user",
+                "content": user_response.text,
+            }
+        )
+
+        if debug:
+            print("\nUSER:")
+            print(user_response.text)
+
+        if user_response.conversation_ended:
+            traj.metrics["persuaded"] = user_response.persuaded
+            break
 
         num_turns += 1
 
