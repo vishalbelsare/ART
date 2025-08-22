@@ -1,6 +1,8 @@
 import asyncio
 import os
+import json
 
+from langchain_core.utils.function_calling import convert_to_openai_tool
 import weave
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -9,6 +11,8 @@ import art
 from persuasion_bot.scenarios import PersuasionScenario, val_scenarios
 from persuasion_bot.user import get_user_response
 from persuasion_bot.utils import generate_conversation_id
+
+from research_agent.research_agent import find_supporting_facts
 
 load_dotenv()
 
@@ -37,6 +41,10 @@ async def rollout(
     )
     traj.metadata["conversation_id"] = generate_conversation_id()
 
+    tool_funcs = [find_supporting_facts]
+
+    tools = [convert_to_openai_tool(t) for t in tool_funcs]
+
     num_turns = 0
 
     while num_turns < 50:
@@ -61,14 +69,65 @@ async def rollout(
             traj.metrics["persuaded"] = user_response.persuaded
             break
 
-        completion = await client.chat.completions.create(
-            model=model.name if model.trainable else model.inference_model_name,
-            messages=traj.messages(),
-            max_completion_tokens=500,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
+        while True:
+            # allow the bot to query the web before responding to the user
+            completion = await client.chat.completions.create(
+                model=model.name if model.trainable else model.inference_model_name,
+                messages=traj.messages(),
+                max_completion_tokens=500,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                tools=tools,
+                tool_choice="auto",
+            )
 
-        traj.messages_and_choices.append(completion.choices[0])
+            traj.messages_and_choices.append(completion.choices[0])
+
+            if (
+                not completion.choices[0].message.tool_calls
+                or len(completion.choices[0].message.tool_calls) == 0
+            ):
+                break
+
+            tool_call = completion.choices[0].message.tool_calls[0]
+            name = tool_call.function.name
+
+            try:
+                args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                traj.messages_and_choices.append(
+                    {
+                        "role": "tool",
+                        "content": f"Invalid tool call arguments: {tool_call.function.arguments}",
+                        "tool_call_id": tool_call.id,
+                    }
+                )
+                continue
+
+            if name == "find_supporting_facts":
+                print("\nBOT:")
+                print(args["user_facing_message"])
+                print(args["instructions"])
+                print()
+                facts = await find_supporting_facts(
+                    user_facing_message="",
+                    instructions=args["instructions"],
+                )
+
+                traj.messages_and_choices.append(
+                    {
+                        "role": "tool",
+                        "content": facts,
+                        "tool_call_id": tool_call.id,
+                    }
+                )
+            else:
+                traj.messages_and_choices.append(
+                    {
+                        "role": "tool",
+                        "content": "Invalid tool call name",
+                        "tool_call_id": tool_call.id,
+                    }
+                )
 
         if debug:
             print("\nBOT:")
@@ -81,9 +140,9 @@ async def rollout(
 
 if __name__ == "__main__":
     model = art.Model(
-        name="gpt-4o-mini",
+        name="gpt-4.1",
         project="persuasion-bot",
-        inference_model_name="openai/gpt-4o-mini",
+        inference_model_name="openai/gpt-4.1",
         inference_api_key=os.getenv("OPENROUTER_API_KEY"),
         inference_base_url="https://openrouter.ai/api/v1",
     )
