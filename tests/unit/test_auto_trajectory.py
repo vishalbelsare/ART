@@ -345,6 +345,7 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
             messages=[message],
             tools=tools,
             base_url="http://localhost:8888/v1",
+            api_key="default",
         )
         assert isinstance(response, litellm.types.utils.ModelResponse)
         choice = convert_litellm_choice_to_openai(response.choices[0])
@@ -358,6 +359,7 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
             ],
             tools=tools,
             base_url="http://localhost:8888/v1",
+            api_key="default",
         )
         assert isinstance(response, litellm.types.utils.ModelResponse)
         choice = convert_litellm_choice_to_openai(response.choices[0])
@@ -369,6 +371,7 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
             tools=tools,
             stream=True,
             base_url="http://localhost:8888/v1",
+            api_key="default",
         )
         assert isinstance(
             stream, litellm.litellm_core_utils.streaming_handler.CustomStreamWrapper
