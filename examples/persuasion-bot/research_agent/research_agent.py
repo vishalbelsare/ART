@@ -43,19 +43,14 @@ client = AsyncOpenAI(
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Domains that commonly block scraping - skip these for faster performance
+# Domains that are truly problematic even with ScrapingBee
 BLOCKED_DOMAINS = {
-    "researchgate.net",
-    "academia.edu",
-    "jstor.org",
-    "springer.com",
-    "nature.com",
-    "sciencedirect.com",
-    "remote.com",  # Blocks content scraping
+    "jstor.org",  # Requires subscription
+    "sciencedirect.com",  # Requires subscription
 }
 
 
@@ -91,10 +86,69 @@ async def search_brave(query: str, count: int = 10) -> List[dict]:
                 raise Exception(f"Brave Search API error: {response.status}")
 
 
-async def scrape_content(url: str, max_retries: int = 2) -> str:
-    """Scrape text content from a webpage with improved headers and retry logic."""
+async def scrape_via_scrapingbee(url: str) -> str:
+    """Scrape content using ScrapingBee API to bypass blocking."""
     start_time = time.time()
-    logger.info(f"Starting to scrape content from: {url}")
+    logger.info(f"Scraping via ScrapingBee: {url}")
+
+    api_key = os.getenv("SCRAPINGBEE_API_KEY")
+    if not api_key:
+        logger.warning("SCRAPINGBEE_API_KEY not set, falling back to direct scraping")
+        return await scrape_direct(url)
+
+    try:
+        params = {
+            "api_key": api_key,
+            "url": url,
+            "render_js": "false",  # Faster without JS rendering
+            "premium_proxy": "true",  # Use premium proxies for better success rate
+            "country_code": "us",  # Use US proxies
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://app.scrapingbee.com/api/v1/",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, "html.parser")
+
+                    # Remove script and style elements
+                    for script in soup(["script", "style", "nav", "footer", "header"]):
+                        script.decompose()
+
+                    # Get text content
+                    text = soup.get_text()
+
+                    # Clean up whitespace
+                    lines = (line.strip() for line in text.splitlines())
+                    chunks = (
+                        phrase.strip() for line in lines for phrase in line.split("  ")
+                    )
+                    text = " ".join(chunk for chunk in chunks if chunk)
+
+                    # Limit text length
+                    final_text = text[:3000] if len(text) > 3000 else text
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"ScrapingBee success: {len(final_text)} characters from {url} in {elapsed:.2f}s"
+                    )
+                    return final_text
+                else:
+                    logger.warning(f"ScrapingBee API error {response.status} for {url}")
+                    return ""
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"ScrapingBee error for {url} after {elapsed:.2f}s: {e}")
+        return ""
+
+
+async def scrape_content(url: str, max_retries: int = 2) -> str:
+    """Main scraping function that tries ScrapingBee first, then falls back to direct scraping."""
+    start_time = time.time()
 
     # Skip known problematic domains to save time
     parsed_url = urlparse(url)
@@ -102,6 +156,22 @@ async def scrape_content(url: str, max_retries: int = 2) -> str:
     if any(blocked in domain for blocked in BLOCKED_DOMAINS):
         logger.info(f"Skipping known blocked domain: {domain}")
         return ""
+
+    # Try ScrapingBee first (works better for cloud instances)
+    if os.getenv("SCRAPINGBEE_API_KEY"):
+        result = await scrape_via_scrapingbee(url)
+        if result:  # If ScrapingBee succeeded
+            return result
+        logger.info(f"ScrapingBee failed for {url}, trying direct scraping")
+
+    # Fall back to direct scraping
+    return await scrape_direct(url, max_retries)
+
+
+async def scrape_direct(url: str, max_retries: int = 2) -> str:
+    """Scrape text content from a webpage with improved headers and retry logic."""
+    start_time = time.time()
+    logger.info(f"Starting direct scraping of: {url}")
 
     # Rotate through different user agents
     user_agents = [
