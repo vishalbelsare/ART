@@ -98,15 +98,24 @@ async def rollout(
                 )
                 print(args["instructions"])
                 print()
-                facts = await find_supporting_facts(
+                facts_list = await find_supporting_facts(
                     user_facing_message="",
                     instructions=args["instructions"],
                 )
 
+                # Convert list of tuples to formatted string for the tool response
+                if facts_list:
+                    formatted_facts = []
+                    for i, (fact, url) in enumerate(facts_list, 1):
+                        formatted_facts.append(f"{i}. {fact} ([Source]({url}))")
+                    facts_content = "\n".join(formatted_facts)
+                else:
+                    facts_content = "No relevant information found for this topic."
+
                 traj.messages_and_choices.append(
                     {
                         "role": "tool",
-                        "content": facts,
+                        "content": facts_content,
                         "tool_call_id": tool_call.id,
                     }
                 )
@@ -119,10 +128,15 @@ async def rollout(
                     }
                 )
 
+        # Ensure bot message is not empty to avoid API errors
+        bot_message = completion.choices[0].message.content
+        if not bot_message or bot_message.strip() == "":
+            bot_message = "I'm having trouble with my response. Could you please rephrase your question?"
+
         # Emit bot message to track in shared conversation dictionary
         await emit_bot_message(
             traj.metadata["conversation_id"],
-            completion.choices[0].message.content,
+            bot_message,
             debug=debug,
         )
 

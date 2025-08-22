@@ -66,50 +66,110 @@ async def search_brave(query: str, count: int = 10) -> List[dict]:
                 raise Exception(f"Brave Search API error: {response.status}")
 
 
-async def scrape_content(url: str) -> str:
-    """Scrape text content from a webpage."""
+async def scrape_content(url: str, max_retries: int = 3) -> str:
+    """Scrape text content from a webpage with improved headers and retry logic."""
     logger.info(f"Starting to scrape content from: {url}")
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            }
-            async with session.get(url, headers=headers, timeout=10) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, "html.parser")
+    # Rotate through different user agents
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+    ]
 
-                    # Remove script and style elements
-                    for script in soup(["script", "style"]):
-                        script.decompose()
+    for attempt in range(max_retries):
+        try:
+            # Create session with improved configuration
+            connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+            timeout = aiohttp.ClientTimeout(total=15, connect=10)
+            
+            async with aiohttp.ClientSession(
+                connector=connector, 
+                timeout=timeout,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Cache-Control": "max-age=0"
+                }
+            ) as session:
+                
+                headers = {
+                    "User-Agent": user_agents[attempt % len(user_agents)],
+                    "Referer": "https://www.google.com/"
+                }
+                
+                logger.info(f"Attempt {attempt + 1}/{max_retries} for {url}")
+                
+                async with session.get(
+                    url, 
+                    headers=headers, 
+                    allow_redirects=True,
+                    max_redirects=10
+                ) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, "html.parser")
 
-                    # Get text content
-                    text = soup.get_text()
+                        # Remove script and style elements
+                        for script in soup(["script", "style", "nav", "footer", "header"]):
+                            script.decompose()
 
-                    # Clean up whitespace
-                    lines = (line.strip() for line in text.splitlines())
-                    chunks = (
-                        phrase.strip() for line in lines for phrase in line.split("  ")
-                    )
-                    text = " ".join(chunk for chunk in chunks if chunk)
+                        # Get text content
+                        text = soup.get_text()
 
-                    # Limit text length
-                    final_text = text[:3000] if len(text) > 3000 else text
-                    logger.info(
-                        f"Successfully scraped {len(final_text)} characters from {url}"
-                    )
+                        # Clean up whitespace
+                        lines = (line.strip() for line in text.splitlines())
+                        chunks = (
+                            phrase.strip() for line in lines for phrase in line.split("  ")
+                        )
+                        text = " ".join(chunk for chunk in chunks if chunk)
 
-                    if not final_text.strip():
-                        logger.warning(f"Scraped content is empty for {url}")
+                        # Limit text length
+                        final_text = text[:3000] if len(text) > 3000 else text
+                        logger.info(
+                            f"Successfully scraped {len(final_text)} characters from {url} on attempt {attempt + 1}"
+                        )
 
-                    return final_text
-                else:
-                    logger.warning(f"Failed to scrape {url}: HTTP {response.status}")
-                    return ""
-    except Exception as e:
-        logger.error(f"Error scraping {url}: {e}")
-        return ""
+                        if not final_text.strip():
+                            logger.warning(f"Scraped content is empty for {url}")
+
+                        return final_text
+                    
+                    elif response.status in [403, 429]:
+                        logger.warning(f"Failed to scrape {url}: HTTP {response.status} on attempt {attempt + 1}")
+                        if attempt < max_retries - 1:
+                            # Exponential backoff for rate limiting
+                            delay = (2 ** attempt) + (attempt * 0.5)
+                            logger.info(f"Waiting {delay:.1f}s before retry...")
+                            await asyncio.sleep(delay)
+                            continue
+                    else:
+                        logger.warning(f"Failed to scrape {url}: HTTP {response.status} on attempt {attempt + 1}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1)
+                            continue
+                        
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout scraping {url} on attempt {attempt + 1}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+                continue
+        except Exception as e:
+            logger.error(f"Error scraping {url} on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+                continue
+    
+    logger.warning(f"Failed to scrape {url} after {max_retries} attempts")
+    return ""
 
 
 async def extract_facts_with_ai(content: str, url: str, instructions: str) -> List[str]:
