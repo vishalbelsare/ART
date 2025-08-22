@@ -32,7 +32,7 @@ client = AsyncOpenAI(
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -148,7 +148,7 @@ async def extract_facts_with_ai(content: str, url: str, instructions: str) -> Li
         facts = []
 
         if "NO_FACTS" in response_content:
-            logger.info(f"AI found no relevant facts in content from {url}")
+            logger.warning(f"AI found no relevant facts in content from {url}")
             return []
 
         for line in response_content.split("\n"):

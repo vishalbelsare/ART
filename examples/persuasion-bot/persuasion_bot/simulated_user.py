@@ -1,3 +1,5 @@
+import json
+
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -15,7 +17,23 @@ class UserResponse(BaseModel):
     persuaded: bool | None = None
 
 
-async def get_user_response(
+async def emit_bot_message_to_simulated_user(
+    conversation_id: str, message: str, debug: bool = False
+) -> None:
+    """Emit bot message to the shared conversation dictionary."""
+    if conversation_id not in existing_conversations_dict:
+        existing_conversations_dict[conversation_id] = []
+    if debug:
+        print(f"\nBOT:\n{message}")
+    existing_conversations_dict[conversation_id].append(
+        {
+            "role": "assistant",
+            "content": message,
+        }
+    )
+
+
+async def get_simulated_user_response(
     scenario: PersuasionScenario,
     conversation_id: str,
     incoming_message: str | None = None,
@@ -72,13 +90,18 @@ async def get_user_response(
 
     tool_calls = completion.choices[0].message.tool_calls
 
-    if tool_calls and len(tool_calls) > 0 and tool_calls[0].name == "end_conversation":
-        final_response = f"""User ended the conversation. Reason: {tool_calls[0].args["reason"]}. Persuaded: {tool_calls[0].args["persuaded"]}"""
+    if (
+        tool_calls
+        and len(tool_calls) > 0
+        and tool_calls[0].function.name == "end_conversation"
+    ):
+        args = json.loads(tool_calls[0].function.arguments)
+        final_response = f"""User ended the conversation. Reason: {args["reason"]}. Persuaded: {args["persuaded"]}"""
 
         return UserResponse(
             text=final_response,
             conversation_ended=True,
-            persuaded=tool_calls[0].args["persuaded"],
+            persuaded=args["persuaded"],
         )
     else:
         return UserResponse(

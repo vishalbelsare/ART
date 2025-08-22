@@ -1,25 +1,33 @@
 import asyncio
-import os
 import json
+import os
+from typing import Awaitable, Callable
 
-from langchain_core.utils.function_calling import convert_to_openai_tool
 import weave
 from dotenv import load_dotenv
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from openai import AsyncOpenAI
+from research_agent.research_agent import find_supporting_facts
 
 import art
 from persuasion_bot.scenarios import PersuasionScenario, val_scenarios
-from persuasion_bot.user import get_user_response
+from persuasion_bot.simulated_user import (
+    UserResponse,
+    emit_bot_message_to_simulated_user,
+    get_simulated_user_response,
+)
 from persuasion_bot.utils import generate_conversation_id
-
-from research_agent.research_agent import find_supporting_facts
 
 load_dotenv()
 
 
 @weave.op
 async def rollout(
-    model: art.Model, scenario: PersuasionScenario, debug: bool = False
+    model: art.Model,
+    scenario: PersuasionScenario,
+    emit_bot_message: Callable[[str, str], Awaitable[None]],
+    get_user_response: Callable[[PersuasionScenario, str], Awaitable[UserResponse]],
+    debug: bool = False,
 ) -> art.Trajectory:
     traj = art.Trajectory(
         messages_and_choices=[],
@@ -51,7 +59,6 @@ async def rollout(
         user_response = await get_user_response(
             scenario=scenario,
             conversation_id=traj.metadata["conversation_id"],
-            incoming_message=traj.messages()[-1]["content"] if num_turns > 0 else None,
         )
 
         traj.messages_and_choices.append(
@@ -104,8 +111,11 @@ async def rollout(
                 continue
 
             if name == "find_supporting_facts":
-                print("\nBOT:")
-                print(args["user_facing_message"])
+                await emit_bot_message(
+                    traj.metadata["conversation_id"],
+                    args["user_facing_message"],
+                    debug=debug,
+                )
                 print(args["instructions"])
                 print()
                 facts = await find_supporting_facts(
@@ -129,9 +139,12 @@ async def rollout(
                     }
                 )
 
-        if debug:
-            print("\nBOT:")
-            print(completion.choices[0].message.content)
+        # Emit bot message to track in shared conversation dictionary
+        await emit_bot_message(
+            traj.metadata["conversation_id"],
+            completion.choices[0].message.content,
+            debug=debug,
+        )
 
         num_turns += 1
 
@@ -150,6 +163,8 @@ if __name__ == "__main__":
         rollout(
             model=model,
             scenario=val_scenarios[0],
+            emit_bot_message=emit_bot_message_to_simulated_user,
+            get_user_response=get_simulated_user_response,
             debug=True,
         )
     )
