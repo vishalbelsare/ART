@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from rollout import rollout
 
 import art
+from art.rewards.ruler import ruler_score_group
 from art.utils import iterate_dataset
 from persuasion_bot.experiments import JustTheFactsConfig, models
 from persuasion_bot.scenarios import train_scenarios, val_scenarios
@@ -65,6 +66,12 @@ async def train(
                     art.TrajectoryGroup((rollout(model, scenario) for _ in range(2)))
                     for scenario in val_scenarios
                 ),
+                after_each=lambda group: ruler_score_group(
+                    group,
+                    "openai/o4-mini",
+                    debug=True,
+                    swallow_exceptions=True,  # Return None on error, filtering out the group
+                ),
             )
 
             await model.log(val_groups, split="val")
@@ -78,6 +85,12 @@ async def train(
                     )
                 )
                 for scenario in batch.items
+            ),
+            after_each=lambda group: ruler_score_group(
+                group,
+                "openai/o4-mini",
+                debug=True,
+                swallow_exceptions=True,  # Return None on error, filtering out the group
             ),
         )
 

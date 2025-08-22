@@ -43,7 +43,7 @@ client = AsyncOpenAI(
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -361,7 +361,7 @@ async def find_supporting_facts(
     # Process all queries in parallel
     logger.info(f"Processing {len(queries[:2])} queries in parallel")
     search_start = time.time()
-    
+
     async def process_query(query):
         """Process a single query and return all valid content."""
         logger.info(f"Processing query: '{query}'")
@@ -414,11 +414,13 @@ async def find_supporting_facts(
     # Process all queries concurrently
     query_tasks = [process_query(query) for query in queries[:2]]
     query_results = await asyncio.gather(*query_tasks, return_exceptions=True)
-    
+
     # Combine search and scraping timing
     search_scrape_time = time.time() - search_start
     timings["search"] += search_scrape_time * 0.3  # Rough estimate for search portion
-    timings["scraping"] += search_scrape_time * 0.7  # Rough estimate for scraping portion
+    timings["scraping"] += (
+        search_scrape_time * 0.7
+    )  # Rough estimate for scraping portion
 
     # Flatten all content from all queries
     for result in query_results:
@@ -430,26 +432,30 @@ async def find_supporting_facts(
 
     # Extract facts from all content in parallel
     if all_content_for_extraction:
-        logger.info(f"Extracting facts from {len(all_content_for_extraction)} pieces of content in parallel")
+        logger.info(
+            f"Extracting facts from {len(all_content_for_extraction)} pieces of content in parallel"
+        )
         fact_extract_start = time.time()
-        
+
         # Create parallel fact extraction tasks
         fact_extraction_tasks = [
             extract_facts_with_ai(content, url, instructions)
             for content, url in all_content_for_extraction
         ]
-        
+
         # Execute all fact extractions concurrently
-        fact_results = await asyncio.gather(*fact_extraction_tasks, return_exceptions=True)
-        
+        fact_results = await asyncio.gather(
+            *fact_extraction_tasks, return_exceptions=True
+        )
+
         timings["fact_extraction"] += time.time() - fact_extract_start
-        
+
         # Process results
         for i, facts in enumerate(fact_results):
             if isinstance(facts, Exception):
                 logger.error(f"Exception during fact extraction: {facts}")
                 continue
-            
+
             if isinstance(facts, list):
                 content, url = all_content_for_extraction[i]
                 for fact in facts:
