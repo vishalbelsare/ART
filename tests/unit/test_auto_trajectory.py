@@ -269,7 +269,7 @@ async def test_auto_trajectory(test_server: None) -> None:
             stream=True,
         ):
             pass
-        # Add optional ART support with a few lines of code
+        # Add ART support with a couple lines of optional code
         if trajectory := art.auto_trajectory():
             trajectory.reward = 1.0
         return chat_completion.choices[0].message.content
