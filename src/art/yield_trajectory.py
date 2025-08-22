@@ -29,5 +29,5 @@ class YieldTrajectoryContext:
 
 
 yield_trajectory_context_var: contextvars.ContextVar[YieldTrajectoryContext] = (
-    contextvars.ContextVar("trajectory", default=YieldTrajectoryContext())
+    contextvars.ContextVar("yield_trajectory_context", default=YieldTrajectoryContext())
 )

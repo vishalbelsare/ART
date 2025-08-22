@@ -128,7 +128,7 @@ async def test_server():
     await runner.cleanup()
 
 
-async def test_yield_trajectory(test_server: None) -> None:
+async def test_auto_trajectory(test_server: None) -> None:
     async def say_hi() -> str | None:
         """A method that says hi to an assistant and returns the response."""
         client = AsyncOpenAI(base_url="http://localhost:8888/v1", api_key="default")
@@ -138,16 +138,12 @@ async def test_yield_trajectory(test_server: None) -> None:
             messages=[message],
         )
         # Add optional ART support with a few lines of code
-        art.yield_trajectory(
-            art.Trajectory(
-                messages_and_choices=[message, chat_completion.choices[0]],
-                reward=1.0,
-            )
-        )
+        if trajectory := art.auto_trajectory():
+            trajectory.reward = 1.0
         return chat_completion.choices[0].message.content
 
-    # Use the capture_yielded_trajectory utility to capture the yielded trajectory
-    trajectory = await art.capture_yielded_trajectory(say_hi())
+    # Use the capture_auto_trajectory utility to capture a trajectory automatically
+    trajectory = await art.capture_auto_trajectory(say_hi())
     assert trajectory.messages_and_choices == [
         {"role": "user", "content": "Hi!"},
         Choice(**mock_response["choices"][0]),
