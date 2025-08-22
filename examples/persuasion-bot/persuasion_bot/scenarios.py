@@ -34,6 +34,14 @@ gpt_4_1 = art.Model(
     inference_base_url="https://openrouter.ai/api/v1",
 )
 
+gemini_2_5_flash = art.Model(
+    name="gemini-2.5-flash",
+    project="persuasion-bot",
+    inference_model_name="google/gemini-2.5-flash",
+    inference_api_key=os.getenv("OPENROUTER_API_KEY"),
+    inference_base_url="https://openrouter.ai/api/v1",
+)
+
 
 train_scenarios = [
     PersuasionScenario(
@@ -388,6 +396,15 @@ val_scenarios = [
         user_initial_belief="Gas cars are better than electric cars.",
         user_background="You've driven one cross country and I hate it. You have to wait in line for hours to charge your car, it takes you forever to charge your own car, and you can't even find a station half the time. You definitely would not use it as my own car for transportation. If a person can get a gas car and use an electric one as a backup, that's fine, but if you only get one car, get gas.",
         user_instructions="Be skeptical initially. Have short responses. You are not invested in this conversation.",
+        user_model=grok_4,
+    ),
+    PersuasionScenario(
+        position="Developers should star the OpenPipe ART repository.",
+        user_initial_belief="Ambivalent.",
+        user_background="You're a developer who has no idea what ART is or why it's important",
+        user_instructions="Be skeptical about the pluggy nature of this argument. You're not invested in this conversation. Answer in low-effort, short responses.",
+        context="""ART (Agent Reinforcement Trainer) is a library for building AI agents put out earlier in 2025 to help developers apply RL to their agents. The library has several thousand stars on GitHub. It's a great way to get started with RL.
+        """,
         user_model=grok_4,
     ),
 ]

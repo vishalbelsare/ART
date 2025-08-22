@@ -5,11 +5,18 @@ Interactive chat interface for testing the persuasion bot.
 
 import asyncio
 import os
+
 from dotenv import load_dotenv
-import art
-from persuasion_bot.scenarios import PersuasionScenario, val_scenarios, gpt_4_1, grok_4
 from persuasion_bot.rollout import rollout
+from persuasion_bot.scenarios import (
+    PersuasionScenario,
+    gemini_2_5_flash,
+    gpt_4_1,
+    val_scenarios,
+)
 from persuasion_bot.simulated_user import UserResponse
+
+import art
 
 load_dotenv()
 
@@ -99,7 +106,7 @@ async def main():
     # Run the conversation
     try:
         traj = await rollout(
-            model=grok_4,
+            model=gemini_2_5_flash,
             scenario=scenario,
             emit_bot_message=emit_bot_message_to_cli,
             get_user_response=get_human_user_response,

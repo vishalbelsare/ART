@@ -579,9 +579,15 @@ async def find_supporting_facts(
     logger.info("=" * 60)
 
     if unique_facts:
+        # Calculate word count statistics
+        total_words = sum(len(fact.split()) for fact, url in unique_facts)
+        
         logger.info("Final facts:")
         for i, (fact, url) in enumerate(unique_facts, 1):
             logger.info(f"  {i}. {fact[:100]}... (from {url})")
+        
+        # Log content statistics
+        logger.info(f"Research facts summary: {len(unique_facts)} facts, {total_words} total words, {total_words / len(unique_facts):.1f} avg words per fact")
     else:
         logger.warning("No facts found during research process!")
 
