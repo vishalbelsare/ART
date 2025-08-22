@@ -23,6 +23,9 @@ class History(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
 
+    def messages(self) -> Messages:
+        return get_messages(self.messages_and_choices)
+
 
 class Trajectory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
