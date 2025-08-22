@@ -3,8 +3,12 @@ import json
 from typing import Any, AsyncIterator, Coroutine, Iterator, Literal, overload
 
 import httpx._models
+from openai import OpenAI
+from openai._streaming import Stream
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
+from .openai import consume_sync_chat_completion_stream
 from .trajectories import History, Trajectory
 
 
@@ -41,6 +45,7 @@ class AutoTrajectoryContext:
             messages_and_choices=[],
             reward=0.0,
         )
+        self.openai_client = OpenAI(api_key="")
 
     def __enter__(self) -> None:
         self.token = auto_trajectory_context_var.set(self)
@@ -53,9 +58,20 @@ class AutoTrajectoryContext:
             request_content = json.loads(getattr(response.request, "_content", b""))
             messages = request_content["messages"]
             tools = request_content.get("tools", None)
-            choice = Choice(
-                **json.loads(getattr(response, "_content_so_far", b""))["choices"][0]
-            )
+            setattr(response, "_content", getattr(response, "_content_so_far", b""))
+            print(getattr(response, "_content"))
+            if request_content.get("stream", False):
+                choice = consume_sync_chat_completion_stream(
+                    Stream(
+                        cast_to=ChatCompletionChunk,
+                        response=response,
+                        client=self.openai_client,
+                    )
+                ).choices[0]
+            else:
+                choice = Choice(
+                    **json.loads(getattr(response, "_content"))["choices"][0]
+                )
             history: Trajectory | History = self.trajectory
             history_index = -1
             while True:

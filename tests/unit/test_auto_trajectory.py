@@ -106,13 +106,83 @@ mock_response = {
     "prompt_logprobs": None,
     "kv_transfer_params": None,
 }
+mock_stream_response = b"""data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"id":"chatcmpl-tool-29e663261e524fcfa2162f4f3d76a7f0","type":"function","index":0,"function":{"name":"get_current_weather","arguments":"{"}}]},"logprobs":{"content":[{"token":"token_id:314","logprob":-0.00015293381875380874,"bytes":[32,123],"top_logprobs":[]}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"id":"chatcmpl-tool-29e663261e524fcfa2162f4f3d76a7f0","type":"function","index":0,"function":{"name":"get_current_weather","arguments":"{"}}]},"logprobs":{"content":[{"token":"token_id:314","logprob":-0.00015293381875380874,"bytes":[32,123],"top_logprobs":[]}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"}"}}]},"logprobs":{"content":[{"token":"token_id:3417","logprob":-3.576278118089249e-7,"bytes":[125,125],"top_logprobs":[]}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"}"}}]},"logprobs":{"content":[{"token":"token_id:3417","logprob":-3.576278118089249e-7,"bytes":[125,125],"top_logprobs":[]}]},"finish_reason":null}]}
+
+data: [DONE]
+
+data: [DONE]
+
+"""
+mock_stream_choice = Choice(
+    **{
+        "finish_reason": "stop",
+        "index": 0,
+        "logprobs": {
+            "content": [
+                {
+                    "token": "token_id:314",
+                    "bytes": [32, 123],
+                    "logprob": -0.00015293381875380874,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "token_id:314",
+                    "bytes": [32, 123],
+                    "logprob": -0.00015293381875380874,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "token_id:3417",
+                    "bytes": [125, 125],
+                    "logprob": -3.576278118089249e-07,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "token_id:3417",
+                    "bytes": [125, 125],
+                    "logprob": -3.576278118089249e-07,
+                    "top_logprobs": [],
+                },
+            ],
+            "refusal": None,
+        },
+        "message": {
+            "content": None,
+            "refusal": None,
+            "role": "assistant",
+            "annotations": None,
+            "audio": None,
+            "function_call": None,
+            "tool_calls": [
+                {
+                    "id": "chatcmpl-tool-29e663261e524fcfa2162f4f3d76a7f0",
+                    "function": {"arguments": "{{}}", "name": "get_current_weather"},
+                    "type": "function",
+                }
+            ],
+        },
+    }
+)
 
 
 @pytest_asyncio.fixture
 async def test_server():
     """Start a test server for the module."""
 
-    async def handler(_: web.Request) -> web.Response:
+    async def handler(request: web.Request) -> web.Response:
+        body = await request.json()
+        if body.get("stream", False):
+            return web.Response(body=mock_stream_response)
         return web.json_response(mock_response)
 
     app = web.Application()
@@ -190,6 +260,15 @@ async def test_auto_trajectory(test_server: None) -> None:
             messages=[message],
             tools=tools,
         )
+        # and another call with tool_choice="required" & stream=True
+        async for _ in await client.chat.completions.create(
+            model="test",
+            messages=[message],
+            tool_choice="required",
+            tools=tools,
+            stream=True,
+        ):
+            pass
         # Add optional ART support with a few lines of code
         if trajectory := art.auto_trajectory():
             trajectory.reward = 1.0
@@ -224,3 +303,8 @@ async def test_auto_trajectory(test_server: None) -> None:
         Choice(**mock_response["choices"][0]),
     ]
     assert trajectory.additional_histories[1].tools == tools
+    assert trajectory.additional_histories[2].messages_and_choices == [
+        message,
+        mock_stream_choice,
+    ]
+    assert trajectory.additional_histories[2].tools == tools
