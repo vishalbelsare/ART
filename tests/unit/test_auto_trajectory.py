@@ -3,6 +3,7 @@ from aiohttp import web
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 
 import art
 
@@ -129,13 +130,65 @@ async def test_server():
 
 
 async def test_auto_trajectory(test_server: None) -> None:
+    message: ChatCompletionMessageParam = {"role": "user", "content": "Hi!"}
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_weather",
+                "description": "Get the current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        }
+    ]
+
     async def say_hi() -> str | None:
         """A method that says hi to an assistant and returns the response."""
         client = AsyncOpenAI(base_url="http://localhost:8888/v1", api_key="default")
-        message: ChatCompletionMessageParam = {"role": "user", "content": "Hi!"}
         chat_completion = await client.chat.completions.create(
             model="test",
             messages=[message],
+            tools=tools,
+        )
+        # test a follow up message
+        chat_completion = await client.chat.completions.create(
+            model="test",
+            messages=[
+                message,
+                {
+                    "role": "assistant",
+                    "content": chat_completion.choices[0].message.content,
+                },
+                message,
+            ],
+            tools=tools,
+        )
+        # and another call without tools (should create a new history)
+        chat_completion = await client.chat.completions.create(
+            model="test",
+            messages=[
+                message,
+                {
+                    "role": "assistant",
+                    "content": chat_completion.choices[0].message.content,
+                },
+                message,
+                {
+                    "role": "assistant",
+                    "content": chat_completion.choices[0].message.content,
+                },
+                message,
+            ],
+        )
+        # and another call with tools, but limited messages (should create another history)
+        chat_completion = await client.chat.completions.create(
+            model="test",
+            messages=[message],
+            tools=tools,
         )
         # Add optional ART support with a few lines of code
         if trajectory := art.auto_trajectory():
@@ -145,6 +198,29 @@ async def test_auto_trajectory(test_server: None) -> None:
     # Use the capture_auto_trajectory utility to capture a trajectory automatically
     trajectory = await art.capture_auto_trajectory(say_hi())
     assert trajectory.messages_and_choices == [
-        {"role": "user", "content": "Hi!"},
+        message,
+        Choice(**mock_response["choices"][0]),
+        message,
         Choice(**mock_response["choices"][0]),
     ]
+    assert trajectory.tools == tools
+    assert trajectory.additional_histories[0].messages_and_choices == [
+        message,
+        {
+            "content": "Hello! How can I assist you today?",
+            "role": "assistant",
+        },
+        message,
+        {
+            "content": "Hello! How can I assist you today?",
+            "role": "assistant",
+        },
+        message,
+        Choice(**mock_response["choices"][0]),
+    ]
+    assert trajectory.additional_histories[0].tools is None
+    assert trajectory.additional_histories[1].messages_and_choices == [
+        message,
+        Choice(**mock_response["choices"][0]),
+    ]
+    assert trajectory.additional_histories[1].tools == tools
