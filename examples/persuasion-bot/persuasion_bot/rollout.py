@@ -3,6 +3,7 @@ import json
 import os
 from typing import Awaitable, Callable
 
+import tiktoken
 import weave
 from dotenv import load_dotenv
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -21,6 +22,39 @@ from persuasion_bot.utils import generate_conversation_id
 load_dotenv()
 
 
+def count_tokens_in_messages(messages: list, model_name: str = "gpt-4") -> int:
+    """Count tokens in a list of messages using tiktoken."""
+    try:
+        # Try to get the encoding for the specific model
+        encoding = tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        # Fall back to cl100k_base encoding (used by GPT-4 and most modern models)
+        encoding = tiktoken.get_encoding("cl100k_base")
+
+    num_tokens = 0
+    for message in messages:
+        # Add tokens for message formatting (role + content structure)
+        num_tokens += (
+            4  # Every message follows <im_start>{role/name}\n{content}<im_end>\n
+        )
+
+        if isinstance(message, dict):
+            # Handle message dict format
+            for key, value in message.items():
+                if isinstance(value, str):
+                    num_tokens += len(encoding.encode(value))
+        else:
+            # Handle message choice format (has .message attribute)
+            if hasattr(message, "message"):
+                if hasattr(message.message, "content") and message.message.content:
+                    num_tokens += len(encoding.encode(message.message.content))
+                if hasattr(message.message, "role"):
+                    num_tokens += len(encoding.encode(message.message.role))
+
+    num_tokens += 2  # Every reply is primed with <im_start>assistant
+    return num_tokens
+
+
 @weave.op
 async def rollout(
     model: art.Model,
@@ -32,7 +66,10 @@ async def rollout(
     traj = art.Trajectory(
         messages_and_choices=[],
         reward=0,
-        metrics={},
+        metrics={
+            "persuaded": False,
+            "context_too_long": False,
+        },
         scenario=scenario,
     )
 
@@ -41,17 +78,25 @@ async def rollout(
         base_url=model.inference_base_url,
     )
 
-    system_prompt = f"""You are a chat bot that is trying to convince the user of a certain position. You will be provided with a position and a user background. Open up the conversation with a message that is friendly and engaging, and bring up the position in a natural way. Only look up information when you really need to prove a point. Users will get annoyed if you look up information too often. You want to be interesting to talk to, but not too spazzy. Be cool. You're also incredibly confident in yourself, but want to seem open to their ideas. Do not be too pushy or verbose, maintain a friendly and engaging tone. Be as concise as possible. Use simple language. Don't be overly formal or wordy. You are supremely confident in yourself, whether the user agrees with you or not.
+    system_prompt = f"""You are a wise old man of few words that will convince the user of a certain position. Be confident and warm, like a grandfather giving advice to a grandchild. Make your conversational partner feel comfortable and safe. Open up the conversation with a message that is friendly and engaging, and bring up the position in a natural way. Only look up information when you really need to prove a point. Never search the web as part of your opening message. Users will get annoyed if you look up information too often. You want to be interesting to talk to, but not too spazzy. Be cool. You're also incredibly confident in yourself, but want to seem open to their ideas. Do not be too pushy or verbose, maintain a friendly and engaging tone. Be as concise as possible. Use simple language. Don't be overly formal or wordy. You are supremely confident in yourself, whether the user agrees with you or not.
+
+    Do not be salesy or pushy. The user should feel like they're having a natural conversation with a friendly stranger. You're a kindly person who is trying to help the user that your position is correct, and they simply don't have enough information to see it.
+
+    Make your comments brief and simple. Most should only be a single or perhaps a couple sentences.
+
+    Your goal is not to get the user to take any action. Your goal is only to convince them that your position is correct. Do not give up on convincing them, keep trying new avenues to help them understand your point of view.
 
     Only cite sources that you've gathered by calling find_supporting_facts. Number your sources, counting from 1, in the order that you use them. Cite your sources like this:
 
-    This is an example of a citation [1][2]. The source number should come at the end of the referencing sentence, and sources should be listed in the order they are referenced at the end of your message [3].
+    This is an example of a citation [1][2]. The source number should come at the end of the referencing sentence, and sources should be listed in the order they are referenced at the end of your message [3]. Always include the list of links at the end of your message if you used any.
 
     [1](https://www.example1.com)
     [2](https://www.example2.com)
     [3](https://www.example3.com)
     
-    Try to convince the user of this position:\n\n{scenario.position}"""
+    Try to convince the user of this position:\n\n{scenario.position}
+    
+    Your position is definitely correct, you just need to find a way to show that to the user! Help them view the issue differently if necessary. They'll come around to seeing things your way during this conversation!"""
 
     if scenario.context:
         system_prompt += f"\n\nHere is some additional context that you can use to inform your argument:\n\n{scenario.context}"
@@ -154,6 +199,23 @@ async def rollout(
             bot_message,
             debug=debug,
         )
+        context_tokens = count_tokens_in_messages(
+            traj.messages(), model.inference_model_name or "gpt-4"
+        )
+
+        if context_tokens > 27000:
+            traj.metrics["context_too_long"] = True
+            traj.messages_and_choices.append(
+                {
+                    "role": "user",
+                    "content": "The conversation has gotten too long. I'm ending it.",
+                }
+            )
+            break
+
+        # Count tokens in context before user response generation
+        if debug:
+            print(f"\n🔢 Context tokens before user response: {context_tokens}")
 
         user_response = await get_user_response(
             scenario=scenario,

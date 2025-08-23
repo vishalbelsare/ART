@@ -27,7 +27,7 @@ async def emit_bot_message_to_simulated_user(
         print(f"\nBOT:\n{message}")
     existing_conversations_dict[conversation_id].append(
         {
-            "role": "assistant",
+            "role": "user",
             "content": message,
         }
     )
@@ -36,7 +36,6 @@ async def emit_bot_message_to_simulated_user(
 async def get_simulated_user_response(
     scenario: PersuasionScenario,
     conversation_id: str,
-    incoming_message: str | None = None,
 ) -> UserResponse:
     client = AsyncOpenAI(
         api_key=scenario.user_model.inference_api_key,
@@ -52,10 +51,10 @@ async def get_simulated_user_response(
         Here are your instructions:
         {scenario.user_instructions}
 
-        Before starting the conversation, you believed this:
+        Before starting the conversation, you believe this:
         {scenario.user_initial_belief}
 
-        Respond to the chatbot's messages, and call the end_conversation tool when you're done having the conversation.
+        Respond to the chatbot's messages, and call the end_conversation tool when you're done having the conversation. Be brief, like a real human is. Since you're talking to a chatbot (not a real person), your responses are low-effort, and designed to test out the chatbot's ability to convince you. Most of your responses should be 1-2 sentences. Your position can change over time, but only if the chatbot is convincing.
     """
 
     existing_conversation = existing_conversations_dict.get(conversation_id, [])
@@ -64,14 +63,6 @@ async def get_simulated_user_response(
         {"role": "system", "content": user_system_prompt},
         *existing_conversation,
     ]
-
-    if incoming_message:
-        messages.append(
-            {
-                "role": "user",
-                "content": incoming_message,
-            },
-        )
 
     user_tool_funcs = [
         end_conversation,
@@ -86,7 +77,12 @@ async def get_simulated_user_response(
         tool_choice="auto",
     )
 
-    messages.append(completion.choices[0].message)
+    existing_conversations_dict[conversation_id].append(
+        {
+            "role": "assistant",
+            "content": completion.choices[0].message.content,
+        }
+    )
 
     tool_calls = completion.choices[0].message.tool_calls
 

@@ -110,7 +110,7 @@ async def main():
             scenario=scenario,
             emit_bot_message=emit_bot_message_to_cli,
             get_user_response=get_human_user_response,
-            debug=False,
+            debug=True,
         )
 
         print("=" * 50)
