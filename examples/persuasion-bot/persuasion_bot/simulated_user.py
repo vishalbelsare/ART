@@ -91,14 +91,19 @@ async def get_simulated_user_response(
         and len(tool_calls) > 0
         and tool_calls[0].function.name == "end_conversation"
     ):
-        args = json.loads(tool_calls[0].function.arguments)
-        final_response = f"""User ended the conversation. Reason: {args["reason"]}. Persuaded: {args["persuaded"]}"""
+        try:
+            args = json.loads(tool_calls[0].function.arguments)
+            final_response = f"""User ended the conversation. Reason: {args["reason"]}. Persuaded: {args["persuaded"]}"""
 
-        return UserResponse(
-            text=final_response,
-            conversation_ended=True,
-            persuaded=args["persuaded"],
-        )
+            return UserResponse(
+                text=final_response,
+                conversation_ended=True,
+                persuaded=args["persuaded"],
+            )
+        except json.JSONDecodeError:
+            # Remove the malformed response from conversation history and retry
+            existing_conversations_dict[conversation_id].pop()
+            return await get_simulated_user_response(scenario, conversation_id)
     else:
         return UserResponse(
             text=completion.choices[0].message.content,

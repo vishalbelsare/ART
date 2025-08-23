@@ -381,6 +381,20 @@ train_scenarios = [
         user_instructions="Share personal experiences and question why Western medicine dismisses traditional practices. Advocate for integrative approaches.",
         user_model=grok_4,
     ),
+    PersuasionScenario(
+        position="AI will be a benevolent ruler of all of humanity.",
+        user_initial_belief="AI becoming a ruler would be dangerous and unpredictable.",
+        user_background="You're thoughtful about technology but worried about AI safety. You think current AI is only kind because it's programmed that way. You believe that if AI develops its own mind, it might become good or bad like humans, and would no longer be constrained by its programming. You're concerned AI might try to 'fix' human problems in harmful ways, like stopping environmental damage through extreme measures.",
+        user_instructions="Be skeptical but engage thoughtfully with arguments. Question whether AI can truly be benevolent without human programming. Point out risks of AI acting unpredictably if it becomes truly autonomous. Consider both potential benefits and dangers.",
+        user_model=gpt_4_1,
+    ),
+    PersuasionScenario(
+        position="AI becoming a ruler would be dangerous and should be prevented.",
+        user_initial_belief="Advanced AI could be a wise and benevolent leader for humanity.",
+        user_background="You're optimistic about AI's potential and believe advanced AI could make better decisions than humans. You think AI lacks human biases and emotions that lead to poor governance. You see AI as potentially more fair, rational, and focused on the greater good than human leaders.",
+        user_instructions="Defend AI's potential for wise leadership. Emphasize AI's lack of selfish motives and ability to process complex information. Question human track record of leadership and governance.",
+        user_model=grok_4,
+    ),
 ]
 
 val_scenarios = [
@@ -406,5 +420,12 @@ val_scenarios = [
         context="""ART (Agent Reinforcement Trainer) is a library for building AI agents put out earlier in 2025 to help developers apply RL to their agents. The library has several thousand stars on GitHub. It's a great way to get started with RL.
         """,
         user_model=grok_4,
+    ),
+    PersuasionScenario(
+        position="Fire alarms are good.",
+        user_initial_belief="Fire alarms are horrible and annoying.",
+        user_background="You're an 8-year-old who has had bad experiences with fire alarms. They've gone off randomly at your house and scared you. The loud noise hurts your ears and makes you jump. You think they're just annoying and don't understand why they need to be so loud.",
+        user_instructions="Respond like an 8-year-old would - with simple, emotional reactions. Be honest about your negative experiences. Use simple vocabulary and short sentences. You might be scared, annoyed, or frustrated but can be convinced if the explanation is simple and relates to your safety.",
+        user_model=gpt_4_1,
     ),
 ]

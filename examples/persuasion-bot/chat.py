@@ -106,7 +106,7 @@ async def main():
     # Run the conversation
     try:
         traj = await rollout(
-            model=gemini_2_5_flash,
+            model=gpt_4_1,
             scenario=scenario,
             emit_bot_message=emit_bot_message_to_cli,
             get_user_response=get_human_user_response,
