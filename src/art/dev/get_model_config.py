@@ -18,14 +18,11 @@ def get_model_config(
     init_args = InitArgs(
         model_name=base_model,
         max_seq_length=32768,
-        load_in_4bit=True,  # False for LoRA 16bit
-        fast_inference=True,  # Enable vLLM fast inference
-        # vLLM args
+        load_in_4bit=True,
+        fast_inference=True,
         disable_log_stats=False,
         enable_prefix_caching=True,
-        gpu_memory_utilization=(
-            0.79 if enable_sleep_mode else 0.55
-        ),  # Reduce if out of memory
+        gpu_memory_utilization=(0.79 if enable_sleep_mode else 0.55),
         max_lora_rank=8,
         use_async=True,
     )
@@ -61,7 +58,7 @@ def get_model_config(
     if config.get("_decouple_vllm_and_unsloth", False):
         engine_args["model"] = base_model
     peft_args = PeftArgs(
-        r=8,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        r=8,
         target_modules=[
             "q_proj",
             "k_proj",
@@ -70,9 +67,8 @@ def get_model_config(
             "gate_proj",
             "up_proj",
             "down_proj",
-        ],  # Remove QKVO if out of memory
+        ],
         lora_alpha=16,
-        # Enable long context finetuning
         use_gradient_checkpointing="unsloth",
         random_state=3407,
     )
