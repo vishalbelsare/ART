@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 from collections import defaultdict
 from contextlib import nullcontext
@@ -379,3 +380,9 @@ def _calculate_logprobs(
 
 def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
     return torch.nn.functional.pad(tensor[:, 1:], (0, 1), value=pad)
+
+
+def free_memory() -> None:
+    for _ in range(3):
+        gc.collect()
+        torch.cuda.empty_cache()

@@ -1,5 +1,4 @@
 import asyncio
-import gc
 import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -22,6 +21,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from ..dev.model import InternalModelConfig
+from .train import free_memory
 
 if TYPE_CHECKING:
     from .service import TrainInputs
@@ -172,9 +172,3 @@ class vLLMState:
                 await self.async_engine.wake_up()
         finally:
             await self.resume_engine()
-
-
-def free_memory() -> None:
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()

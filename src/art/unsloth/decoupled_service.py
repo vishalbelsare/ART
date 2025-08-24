@@ -1,5 +1,4 @@
 import asyncio
-import gc
 import logging
 import os
 import time
@@ -30,7 +29,7 @@ from ..preprocessing.pack import (
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
-from .train import train
+from .train import free_memory, train
 
 
 class CausalLM(PreTrainedModel, GenerationMixin):
@@ -116,7 +115,7 @@ class DecoupledUnslothService:
         self._is_sleeping = True
 
         # Free memory after vLLM workers are asleep
-        self._free_memory()
+        free_memory()
 
         # Load packed tensors
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
@@ -200,7 +199,7 @@ class DecoupledUnslothService:
                     assert result is not None, "The training task should never finish."
                     self._state.results_queue.task_done()
                     if warmup:
-                        self._free_memory()
+                        free_memory()
                         await asyncio.sleep(0.1)
                         warmup = False
                     else:
@@ -215,7 +214,7 @@ class DecoupledUnslothService:
         self._state.trainer.save_model(checkpoint_dir)
 
         # Free memory before waking up vLLM
-        self._free_memory()
+        free_memory()
 
         # Remove pids.txt to signal workers to wake up
         if os.path.exists(pids_path):
@@ -240,12 +239,6 @@ class DecoupledUnslothService:
 
         if verbose:
             print("DecoupledUnslothService.train complete")
-
-    def _free_memory(self) -> None:
-        """Free GPU memory."""
-        for _ in range(3):
-            gc.collect()
-            torch.cuda.empty_cache()
 
     @cached_property
     def _state(self) -> UnslothState:
