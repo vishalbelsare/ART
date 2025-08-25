@@ -134,11 +134,11 @@ def patch_get_lora_tokenizer_async() -> None:
         patch
     )
 
-    async def patch(self, *args: Any, **kwargs: Any) -> None:
+    async def patch2(self, *args: Any, **kwargs: Any) -> None:
         return self.tokenizer
 
     vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = (
-        patch  # type: ignore
+        patch2  # type: ignore
     )
 
 
