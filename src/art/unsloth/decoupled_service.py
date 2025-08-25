@@ -29,7 +29,7 @@ from ..preprocessing.pack import (
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
-from .train import free_memory, train
+from .train import gc_and_empty_cuda_cache, train
 
 
 class CausalLM(PreTrainedModel, GenerationMixin):
@@ -115,7 +115,7 @@ class DecoupledUnslothService:
         self._is_sleeping = True
 
         # Free memory after vLLM workers are asleep
-        free_memory()
+        gc_and_empty_cuda_cache()
 
         # Load packed tensors
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
@@ -199,7 +199,7 @@ class DecoupledUnslothService:
                     assert result is not None, "The training task should never finish."
                     self._state.results_queue.task_done()
                     if warmup:
-                        free_memory()
+                        gc_and_empty_cuda_cache()
                         await asyncio.sleep(0.1)
                         warmup = False
                     else:
@@ -214,7 +214,7 @@ class DecoupledUnslothService:
         self._state.trainer.save_model(checkpoint_dir)
 
         # Free memory before waking up vLLM
-        free_memory()
+        gc_and_empty_cuda_cache()
 
         # Remove pids.txt to signal workers to wake up
         if os.path.exists(pids_path):

@@ -21,7 +21,7 @@ from vllm.worker.multi_step_model_runner import MultiStepModelRunner
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from ..dev.model import InternalModelConfig
-from .train import free_memory
+from .train import gc_and_empty_cuda_cache
 
 if TYPE_CHECKING:
     from .service import TrainInputs
@@ -164,10 +164,10 @@ class vLLMState:
                     # Reset prefix cache and discard KV cache
                     await self.async_engine.reset_prefix_cache()
                     await self.async_engine.sleep(level=2)
-                free_memory()
+                gc_and_empty_cuda_cache()
                 yield
             finally:
-                free_memory()
+                gc_and_empty_cuda_cache()
                 await asyncio.sleep(0.1)
                 await self.async_engine.wake_up()
         finally:

@@ -105,9 +105,9 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         next_input_ids = shift_tensor(inputs["tokens"], 0)
         chunk_size = _config.get("logprob_calculation_chunk_size", 1024)
         # Assert that sequence length is evenly divisible by the chunk size
-        assert seq_len % chunk_size == 0, (
-            f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
-        )
+        assert (
+            seq_len % chunk_size == 0
+        ), f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
         new_logprobs, entropies = calculate_logprobs(
             dtype_for_autocasting,
@@ -354,7 +354,9 @@ def _calculate_logprobs(
         chunk_logits = torch.matmul(chunk_hs, lm_head_t)  # [B, chunk_size, V]
         chunk_selected_logits = torch.gather(
             chunk_logits, dim=-1, index=chunk_input_ids.unsqueeze(-1)
-        ).squeeze(-1)  # [B, chunk_size]
+        ).squeeze(
+            -1
+        )  # [B, chunk_size]
         chunk_logsumexp = torch.logsumexp(chunk_logits, dim=-1)  # [B, chunk_size]
         log_probs[:, i : i + chunk_size] = chunk_selected_logits - chunk_logsumexp
 
@@ -382,7 +384,5 @@ def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
     return torch.nn.functional.pad(tensor[:, 1:], (0, 1), value=pad)
 
 
-def free_memory() -> None:
-    for _ in range(3):
-        gc.collect()
-        torch.cuda.empty_cache()
+def gc_and_empty_cuda_cache(n: int = 3) -> None:
+    [gc.collect() >= 0 and torch.cuda.empty_cache() for _ in range(n)]

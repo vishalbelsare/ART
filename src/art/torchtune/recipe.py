@@ -48,7 +48,7 @@ from tqdm import tqdm
 
 from .. import dev, types
 from ..preprocessing.pack import PackedTensors, packed_tensors_from_dir
-from ..unsloth.train import free_memory
+from ..unsloth.train import gc_and_empty_cuda_cache
 from .batch import Batch
 from .config import (
     CompileConfig,
@@ -1295,7 +1295,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             except Exception as e:
                 print(f"Failed to move optimizer-in-backward states: {e}")
 
-        free_memory()
+        gc_and_empty_cuda_cache()
 
         self._current_device = device
 

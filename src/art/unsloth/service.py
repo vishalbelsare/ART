@@ -167,14 +167,14 @@ class UnslothService:
                     for task in done:
                         result = task.result()
                         # If `result` is `None`, the training task finished somehow.
-                        assert result is not None, (
-                            "The training task should never finish."
-                        )
+                        assert (
+                            result is not None
+                        ), "The training task should never finish."
                         self.results_queue.task_done()
                         if warmup:
-                            from .state import free_memory
+                            from .state import gc_and_empty_cuda_cache
 
-                            free_memory()
+                            gc_and_empty_cuda_cache()
                             await asyncio.sleep(0.1)
                             warmup = False
                         else:
