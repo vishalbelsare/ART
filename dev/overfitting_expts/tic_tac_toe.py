@@ -306,14 +306,14 @@ async def train():
     for _ in range(await model.get_step(), 1_000):
         train_groups = await art.gather_trajectory_groups(
             (
-                art.TrajectoryGroup(rollout(openai_client) for _ in range(20))
-                for _ in range(10)
+                art.TrajectoryGroup(rollout(openai_client) for _ in range(128))
+                for _ in range(1)
             ),
             pbar_desc="gather",
         )
         await model.train(
             train_groups,
-            config=art.TrainConfig(learning_rate=1e-4),
+            config=art.TrainConfig(learning_rate=1e-5),
             _config=art.dev.TrainConfig(
                 precalculate_logprobs=True,
             ),

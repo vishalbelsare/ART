@@ -10,7 +10,7 @@ import art
 
 trainable_models = {
     "001": art.TrainableModel(
-        name="overfitting-001-4",
+        name="overfitting-001-6",
         project="overfitting_experiments",
         base_model="Qwen/Qwen2.5-3B-Instruct",
         _internal_config=art.dev.InternalModelConfig(
