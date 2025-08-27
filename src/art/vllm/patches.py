@@ -123,26 +123,22 @@ def patch_lora_request() -> None:
 
 
 def patch_get_lora_tokenizer_async() -> None:
-    """
-    Patches an Unsloth patch that causes issues with vLLM.
-
-    Specifically, Unsloth patches get_lora_tokenizer_async with a non-async function, which causes issues.
-    """
     import vllm.transformers_utils.tokenizer
     import vllm.transformers_utils.tokenizer_group
 
-    async def async_noop(*_, **__) -> None:
+    async def patch(*_: Any, **__: Any) -> None:
         return None
 
-    async def async_get_lora_tokenizer(self, *args, **kwargs):
+    vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = patch  # type: ignore
+    vllm.transformers_utils.tokenizer_group.get_lora_tokenizer_async = (  # type: ignore
+        patch
+    )
+
+    async def patch2(self, *args: Any, **kwargs: Any) -> None:
         return self.tokenizer
 
-    vllm.transformers_utils.tokenizer.get_lora_tokenizer_async = async_noop  # type: ignore
-    vllm.transformers_utils.tokenizer_group.get_lora_tokenizer_async = (  # type: ignore
-        async_noop
-    )
     vllm.transformers_utils.tokenizer_group.TokenizerGroup.get_lora_tokenizer_async = (
-        async_get_lora_tokenizer  # type: ignore
+        patch2  # type: ignore
     )
 
 

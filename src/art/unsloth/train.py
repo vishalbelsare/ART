@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import os
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, cast
 
@@ -26,6 +28,14 @@ async def train(
     _log = trainer.log
     trainer.compute_loss = get_compute_loss_fn(trainer)
     trainer.log = get_log_fn(trainer, results_queue)
+    # Ensure we have a metrics container in the expected format
+    try:
+        is_dict = isinstance(getattr(trainer, "_metrics", None), dict)
+        is_train_dict = is_dict and isinstance(trainer._metrics.get("train"), dict)
+    except Exception:
+        is_train_dict = False
+    if not is_train_dict:
+        trainer._metrics = {"train": defaultdict(list)}
     try:
         trainer.train()
     finally:
@@ -44,11 +54,17 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         _config: dev.TrainConfig = inputs.pop("_config")  # type: ignore
         return_new_logprobs: bool = inputs.pop("return_new_logprobs", False)  # type: ignore
 
+        num_trajectories_learning_rate_multiplier = (
+            torch.unique(inputs["group_ids"]).numel()
+            - torch.unique(inputs["parent_ids"]).numel()
+        ) ** _config.get("num_trajectories_learning_rate_multiplier_power", 0.0)
         if optimizer := trainer.optimizer:
             optimizer = getattr(optimizer, "optimizer", optimizer)
             if param_groups := getattr(optimizer, "param_groups"):
                 for param_group in param_groups:
-                    param_group["lr"] = config.learning_rate
+                    param_group["lr"] = (
+                        config.learning_rate * num_trajectories_learning_rate_multiplier
+                    )
                     # param_group["betas"] = config.betas
                     # if param_group.get("weight_decay"):
                     #     param_group["weight_decay"] = config.weight_decay
@@ -364,3 +380,7 @@ def _calculate_logprobs(
 
 def shift_tensor(tensor: torch.Tensor, pad: int | float | bool) -> torch.Tensor:
     return torch.nn.functional.pad(tensor[:, 1:], (0, 1), value=pad)
+
+
+def gc_and_empty_cuda_cache(n: int = 3) -> None:
+    [gc.collect() >= 0 and torch.cuda.empty_cache() for _ in range(n)]
