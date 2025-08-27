@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'linux'",
@@ -4026,7 +4026,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.4.11"
+version = "0.4.12"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
