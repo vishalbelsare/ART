@@ -1,14 +1,17 @@
-from pydantic import BaseModel
-import art
-from art.local import LocalBackend
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
-import openai
 import asyncio
 import json
 import os
 import random
-from typing import Dict, Any
+from typing import Any, Dict
+
+import openai
+from configs import OverfittingModelConfig
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+
+import art
+from art.local import LocalBackend
 
 load_dotenv()
 
@@ -26,7 +29,9 @@ async def train():
         with open(config_path, "r") as f:
             model_config = json.load(f)
         model = art.TrainableModel.model_validate(model_config)
+        model.config = OverfittingModelConfig.model_validate(model_config["config"])
         print(f"Loaded model config from {config_path}: {model.name}")
+        print(f"Model config: {model.config}")
     else:
         model = art.TrainableModel(
             name="001",
@@ -145,7 +150,7 @@ Write a thoughtful essay of 200-300 words on your chosen topic."""
             train_groups,
             config=art.TrainConfig(learning_rate=1e-4),
             _config=art.dev.TrainConfig(
-                precalculate_logprobs=True,
+                precalculate_logprobs=model.config.precalculate_logprobs,
             ),
         )
 

@@ -1,11 +1,14 @@
 import argparse
+import concurrent.futures
 import json
 import textwrap
-import concurrent.futures
 import traceback
+
 import sky
+from configs import OverfittingModelConfig
 from dotenv import dotenv_values
 from sky import ClusterStatus
+
 import art
 
 trainable_models = {
@@ -15,6 +18,40 @@ trainable_models = {
         base_model="Qwen/Qwen2.5-3B-Instruct",
         _internal_config=art.dev.InternalModelConfig(
             engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
+        ),
+    ),
+    "002": art.TrainableModel(
+        name="overfitting-002",
+        project="overfitting_experiments",
+        base_model="unsloth/gemma-3-12b-it",
+        config=OverfittingModelConfig(precalculate_logprobs=True),
+        _internal_config=art.dev.InternalModelConfig(
+            _decouple_vllm_and_unsloth=True,
+            engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.75),
+            peft_args={
+                "target_modules": None,
+                "finetune_vision_layers": False,
+                "finetune_language_layers": True,
+                "finetune_attention_modules": True,
+                "finetune_mlp_modules": True,
+            },
+        ),
+    ),
+    "003": art.TrainableModel(
+        name="overfitting-003-no-precalc",
+        project="overfitting_experiments",
+        base_model="unsloth/gemma-3-12b-it",
+        config=OverfittingModelConfig(precalculate_logprobs=False),
+        _internal_config=art.dev.InternalModelConfig(
+            _decouple_vllm_and_unsloth=True,
+            engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.75),
+            peft_args={
+                "target_modules": None,
+                "finetune_vision_layers": False,
+                "finetune_language_layers": True,
+                "finetune_attention_modules": True,
+                "finetune_mlp_modules": True,
+            },
         ),
     ),
 }
@@ -74,7 +111,8 @@ def launch_model(model_key: str):
 
             # Install project in editable mode
             uv remove openpipe-art
-            uv add --editable ~/ART --extra backend --extra plotting
+            uv add openpipe-art==0.4.5 --extra backend --extra plotting
+            # uv add --editable ~/ART --extra backend --extra plotting
 
             # Sync dependencies
             uv sync
@@ -85,12 +123,15 @@ def launch_model(model_key: str):
         f"""
         # Run the overfitting experiment
         uv remove openpipe-art
-        uv add --editable ~/ART --extra backend --extra plotting
+        uv add openpipe-art==0.4.5 --extra backend --extra plotting
+        # uv add --editable ~/ART --extra backend --extra plotting
 
         echo '{model_json}' > model_config.json
         uv run {args.experiment}.py
     """
     )
+
+    model_key = model_key + "-" + args.experiment
 
     task = sky.Task(
         name=f"overfitting-expt-{model_key}",

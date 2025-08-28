@@ -1,15 +1,18 @@
-import traceback
-from pydantic import BaseModel
-import art
-from art.local import LocalBackend
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
-import openai
 import asyncio
 import json
 import os
 import random
-from typing import List, Dict, Literal
+import traceback
+from typing import Dict, List, Literal
+
+import openai
+from configs import OverfittingModelConfig
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+
+import art
+from art.local import LocalBackend
 
 load_dotenv()
 
@@ -106,17 +109,12 @@ async def train():
         with open(config_path, "r") as f:
             model_config = json.load(f)
         model = art.TrainableModel.model_validate(model_config)
+        model.config = OverfittingModelConfig.model_validate(model_config["config"])
         print(f"Loaded model config from {config_path}: {model.name}")
+        print(f"Model config: {model.config}")
     else:
-        model = art.TrainableModel(
-            name="001",
-            project="life-coaching",
-            base_model="Qwen/Qwen2.5-7B-Instruct",
-            _internal_config=art.dev.InternalModelConfig(
-                engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
-            ),
-        )
-        print("Using default model config")
+        raise ValueError(f"Model config file {config_path} not found")
+
     await model.register(backend)
 
     # Life problems for users
@@ -231,7 +229,7 @@ async def train():
             train_groups,
             config=art.TrainConfig(learning_rate=1e-4),
             _config=art.dev.TrainConfig(
-                precalculate_logprobs=True,
+                precalculate_logprobs=model.config.precalculate_logprobs,
             ),
         )
 

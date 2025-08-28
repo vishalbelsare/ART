@@ -3,11 +3,12 @@ name = "overfitting-expts"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "skypilot-nightly[runpod,hyperbolic]==1.0.0.dev20250717",
     "openpipe-art",
     "tblib>=3.1.0",
+    "gql<4"
 ]
 
 [tool.uv.sources]

@@ -1,34 +1,32 @@
-import art
-from art.local import LocalBackend
-from dotenv import load_dotenv
-import openai
 import asyncio
 import json
 import os
+
+import openai
+from configs import OverfittingModelConfig
+from dotenv import load_dotenv
+
+import art
+from art.local import LocalBackend
 
 load_dotenv()
 
 
 async def train():
     backend = LocalBackend()
-    
+
     # Load model config from JSON file if it exists, otherwise use default
     config_path = "model_config.json"
     if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
+        with open(config_path, "r") as f:
             model_config = json.load(f)
         model = art.TrainableModel.model_validate(model_config)
+        model.config = OverfittingModelConfig.model_validate(model_config["config"])
         print(f"Loaded model config from {config_path}: {model.name}")
+        print(f"Model config: {model.config}")
     else:
-        model = art.TrainableModel(
-            name="001",
-            project="yes-no-maybe",
-            base_model="Qwen/Qwen2.5-7B-Instruct",
-            _internal_config=art.dev.InternalModelConfig(
-                engine_args=art.dev.EngineArgs(gpu_memory_utilization=0.7),
-            ),
-        )
-        print("Using default model config")
+        raise ValueError(f"Model config file {config_path} not found")
+
     await model.register(backend)
 
     async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
@@ -87,7 +85,7 @@ async def train():
             train_groups,
             config=art.TrainConfig(learning_rate=1e-4),
             _config=art.dev.TrainConfig(
-                precalculate_logprobs=True,
+                precalculate_logprobs=model.config.precalculate_logprobs,
             ),
         )
 
