@@ -9,7 +9,18 @@ import os
 from pathlib import Path
 import signal
 import time
-from typing import Any, AsyncIterator, Generic, Iterable, TypeVar, cast
+from typing import (
+    Any,
+    AsyncIterator,
+    Generic,
+    Iterable,
+    Mapping,
+    Sequence,
+    TypeVar,
+    cast,
+)
+
+from typing_extensions import TypeIs
 
 T = TypeVar("T")
 
@@ -33,10 +44,18 @@ _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 
 
+def _is_eval_mapping(
+    result: Sequence[art.Trajectory | art.TrajectoryGroup]
+    | Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]],
+) -> TypeIs[Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]]]:
+    return isinstance(result, Mapping)
+
+
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
     """Convert a sync Iterable to an AsyncIterator, or pass through if already async."""
     if isinstance(iterable, AsyncIterator):
-        return iterable
+        # ty cannot currently preserve T through this runtime generic check.
+        return cast(AsyncIterator[T], iterable)
 
     async def _iter():
         for item in iterable:
@@ -760,11 +779,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             finally:
                 token.var.reset(token)
                 eval_elapsed = time.monotonic() - eval_started
-            splits: dict[str, list[art.Trajectory | art.TrajectoryGroup]]
-            if isinstance(result, dict):
-                splits = result
-            else:
-                splits = {"val": result}
+            splits = result if _is_eval_mapping(result) else {"val": result}
 
             logged_eval_timing = False
             for split_name, items in splits.items():
@@ -809,7 +824,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     @staticmethod
     def _normalize_eval_items(
-        items: list[art.Trajectory | art.TrajectoryGroup],
+        items: Sequence[art.Trajectory | art.TrajectoryGroup],
     ) -> tuple[list[TrajectoryGroup], list[art.Trajectory]]:
         if not items:
             return [], []
@@ -970,7 +985,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.model.merge_state({PIPELINE_STATE_KEY: payload})
 
     def _log_checkpoint_history(self, step: int, metrics: dict[str, float]) -> None:
-        row = {
+        row: dict[str, int | float | str] = {
             (key if key.startswith("checkpoint/") else f"checkpoint/{key}"): value
             for key, value in metrics.items()
             if value == value

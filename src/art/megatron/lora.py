@@ -874,8 +874,12 @@ class LoRAPublishPlanner:
                 for suffix, param in module._lora_params(slot_ref):
                     if not module._should_export_parameter(param):
                         continue
-                    sharded = bool(param.lora_tp_sharded)  # type: ignore[attr-defined]
-                    shard_domain = param.lora_shard_domain  # type: ignore[attr-defined]
+                    sharded = bool(getattr(param, "lora_tp_sharded"))
+                    shard_domain = getattr(param, "lora_shard_domain")
+                    if shard_domain not in ("tp", "expert_tp"):
+                        raise RuntimeError(
+                            f"invalid LoRA shard domain: {shard_domain!r}"
+                        )
                     templates.append(
                         _LoraPublishTemplate(
                             adapter_model_prefix=module.adapter_model_prefix,
@@ -1046,6 +1050,13 @@ def _expert_grouped_lora_forward(
     return lora(x, tokens_per_expert=tokens_per_expert)
 
 
+def _out_features(module: object) -> int:
+    out_features = getattr(module, "out_features", None)
+    if not isinstance(out_features, int):
+        raise TypeError(f"{type(module).__name__} has no integer out_features")
+    return out_features
+
+
 @torch.compiler.disable
 def _expert_grouped_lora_dual_forward(
     module: "MLPExpertsLinearFC1LoRA",
@@ -1056,7 +1067,7 @@ def _expert_grouped_lora_dual_forward(
     if isinstance(counts, list):
         counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
     if x.shape[0] == 0:
-        return x.new_zeros((x.shape[0], module.linear_fc1.out_features))
+        return x.new_zeros((x.shape[0], module.out_features))
     gate = module.gate_lora.active_lora_tensors()
     up = module.up_lora.active_lora_tensors()
     if gate is None or up is None:
@@ -1473,12 +1484,13 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.linear_fc1 = linear_fc1
+        self.out_features = _out_features(linear_fc1)
         self.fused_gate_up = bool(fused_gate_up)
         if self.fused_gate_up:
             self.lora = _parallel_lora(
                 adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_up_proj",
                 linear=linear_fc1,
-                out_features=linear_fc1.out_features,
+                out_features=self.out_features,
                 rank=rank,
                 alpha=alpha,
                 layout="column",
@@ -1487,7 +1499,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 allreduce=False,
                 num_local_experts=num_local_experts,
             )
-            gate_out_features = linear_fc1.out_features // 2
+            gate_out_features = self.out_features // 2
             expert_tp_world_size = _get_shard_world_size("expert_tp")
             _set_lora_shard_strategy_metadata(
                 self.lora.B_T,
@@ -1501,7 +1513,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             self.gate_lora, self.up_lora = _parallel_lora_pair(
                 adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}",
                 linear=linear_fc1,
-                out_features=linear_fc1.out_features // 2,
+                out_features=self.out_features // 2,
                 rank=rank,
                 alpha=alpha,
                 layout="column",
@@ -1521,7 +1533,10 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         )(x, tokens_per_expert)
         adapter_out = (
             _expert_grouped_lora_forward(
-                self.lora, x, tokens_per_expert, self.linear_fc1.out_features
+                self.lora,
+                x,
+                tokens_per_expert,
+                self.out_features,
             )
             if self.fused_gate_up
             else _expert_grouped_lora_dual_forward(self, x, tokens_per_expert)
@@ -1540,10 +1555,11 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.linear_fc2 = linear_fc2
+        self.out_features = _out_features(linear_fc2)
         self.lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.down_proj",
             linear=linear_fc2,
-            out_features=linear_fc2.out_features,
+            out_features=self.out_features,
             rank=rank,
             alpha=alpha,
             layout="row",
@@ -1564,7 +1580,10 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
             self.linear_fc2,
         )(x, tokens_per_expert)
         adapter_out = _expert_grouped_lora_forward(
-            self.lora, x, tokens_per_expert, self.linear_fc2.out_features
+            self.lora,
+            x,
+            tokens_per_expert,
+            self.out_features,
         )
         # the reason there is no TP comm here is because the MoE token routing handles
         # expert TP comm externally
@@ -1703,7 +1722,7 @@ def wrap_standard_self_attention(
             "linear_qkv",
             TELayerNormColumnParallelLinear,
         )
-        self_attention.linear_qkv = SelfAttentionLinearQKVLoRA(
+        linear_qkv_lora = SelfAttentionLinearQKVLoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.self_attn",
             linear_qkv=self_attention_linear_qkv,
             rank=rank,
@@ -1711,6 +1730,7 @@ def wrap_standard_self_attention(
             provider=provider,
             target_modules=target_modules,
         )
+        setattr(self_attention, "linear_qkv", linear_qkv_lora)
 
 
 def wrap_gated_delta_net_attention(
@@ -1768,9 +1788,9 @@ def wrap_grouped_moe_experts(
         mlp_experts_linear_fc1 = _unwrap_attr(
             experts.linear_fc1,
             "linear_fc1",
-            TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
+            TEColumnParallelGroupedLinear,  # type: ignore
         )
-        experts.linear_fc1 = MLPExpertsLinearFC1LoRA(
+        linear_fc1_lora = MLPExpertsLinearFC1LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
             linear_fc1=mlp_experts_linear_fc1,
             rank=rank,
@@ -1778,6 +1798,7 @@ def wrap_grouped_moe_experts(
             num_local_experts=experts.num_local_experts,
             fused_gate_up=fused_gate_up,
         )
+        setattr(experts, "linear_fc1", linear_fc1_lora)
     wrap_fc2 = (
         wrap_fc1 if fused_gate_up else _targets_include(target_modules, "down_proj")
     )
@@ -1785,15 +1806,16 @@ def wrap_grouped_moe_experts(
         linear_fc2 = _unwrap_attr(
             experts.linear_fc2,
             "linear_fc2",
-            TERowParallelGroupedLinear,  # type: ignore[arg-type]
+            TERowParallelGroupedLinear,  # type: ignore
         )
-        experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
+        linear_fc2_lora = MLPExpertsLinearFC2LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
             linear_fc2=linear_fc2,
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
         )
+        setattr(experts, "linear_fc2", linear_fc2_lora)
 
 
 def wrap_split_mlp_lora(
