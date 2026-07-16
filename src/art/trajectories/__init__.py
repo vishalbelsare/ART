@@ -46,7 +46,11 @@ import pydantic
 from typing_extensions import TypedDict, deprecated
 
 from ..types import Messages, MessagesAndChoices, Tools
-from ._serialization import _CompactModel
+from ._serialization import (
+    _CompactModel,
+    serialize_chat_completion,
+    serialize_messages_and_choices,
+)
 
 # Deliberately open: Pydantic enforces serializability when callers dump in JSON mode.
 MetadataValue = Any
@@ -126,6 +130,10 @@ class ChatCompletionsExchange(pydantic.BaseModel):
     start_time: datetime
     end_time: datetime
 
+    @pydantic.field_serializer("response", when_used="json")
+    def serialize_response(self, response: ChatCompletion) -> dict[str, Any]:
+        return serialize_chat_completion(response)
+
     @pydantic.computed_field
     @property
     def model(self) -> str | None:
@@ -201,6 +209,10 @@ class PydanticException(pydantic.BaseModel):
 class History(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
+
+    @pydantic.field_serializer("messages_and_choices", when_used="json")
+    def serialize_messages_and_choices(self, value: MessagesAndChoices) -> list[Any]:
+        return serialize_messages_and_choices(value)
 
     def messages(self) -> Messages:
         return get_messages(self.messages_and_choices)
@@ -291,6 +303,7 @@ class Trajectory(_CompactModel):
     exchanges: TrajectoryExchanges = pydantic.Field(default_factory=TrajectoryExchanges)
     messages_and_choices: MessagesAndChoices = pydantic.Field(
         default_factory=list,
+        exclude_if=lambda value: not value,
     )
     tools: Tools | None = None
     additional_histories: list[History] = pydantic.Field(
@@ -303,6 +316,10 @@ class Trajectory(_CompactModel):
     metadata: dict[str, MetadataValue] = pydantic.Field(default_factory=dict)
     logs: list[str] = pydantic.Field(default_factory=list)
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
+
+    @pydantic.field_serializer("messages_and_choices", when_used="json")
+    def serialize_messages_and_choices(self, value: MessagesAndChoices) -> list[Any]:
+        return serialize_messages_and_choices(value)
 
     @pydantic.model_validator(mode="after")
     def validate_representation(self) -> Trajectory:
@@ -397,6 +414,8 @@ class TrajectoryGroup(_CompactModel):
     metadata: dict[str, MetadataValue] = pydantic.Field(default_factory=dict)
     metrics: dict[str, float | int | bool] = pydantic.Field(default_factory=dict)
     logs: list[str] = pydantic.Field(default_factory=list)
+    _collect_packing_shape: bool = pydantic.PrivateAttr(default=False)
+    _packed_group_shape: Any = pydantic.PrivateAttr(default=None)
 
     @overload
     def __new__(
@@ -503,6 +522,7 @@ class TokenizedTrajectory(pydantic.BaseModel):
     token_ids: list[int]
     logprobs: list[float]
     assistant_mask: list[bool]
+    sampled_spans: list[tuple[int, int]]
     underlying: Trajectory
 
 

@@ -3,8 +3,30 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Literal
 
+from openai.types.chat import ChatCompletion
+from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel
 from pydantic.main import IncEx
+
+from ..openai import ART_MOE_ROUTING_METADATA_KEY
+
+
+def serialize_messages_and_choices(items: list[Any]) -> list[dict[str, Any]]:
+    return [
+        item.model_dump(mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY})
+        if isinstance(item, Choice)
+        else dict(item)
+        for item in items
+    ]
+
+
+def serialize_chat_completion(response: ChatCompletion) -> dict[str, Any]:
+    return response.model_dump(
+        mode="json",
+        exclude={
+            "choices": {"__all__": {ART_MOE_ROUTING_METADATA_KEY}},
+        },
+    )
 
 
 class _CompactModel(BaseModel):

@@ -8,6 +8,7 @@ from typing import Awaitable, Callable, Iterable, Iterator, Literal, Sequence, o
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
 
+from .preprocessing.vllm_tokens import choice_completion_tokens
 from .trajectories import Trajectory, TrajectoryGroup
 
 
@@ -181,15 +182,24 @@ def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
         if completion_tokens is not None:
             trajectory.metrics["completion_tokens"] = completion_tokens
     else:
-        logprobs = [
-            message_or_choice.logprobs
-            for message_or_choice in trajectory.messages_and_choices
-            if isinstance(message_or_choice, Choice)
-            if message_or_choice.logprobs
+        choices = [
+            item
+            for history in (
+                trajectory.messages_and_choices,
+                *(
+                    history.messages_and_choices
+                    for history in trajectory.additional_histories
+                ),
+            )
+            for item in history
+            if isinstance(item, Choice)
         ]
-        if logprobs:
+        completion_tokens = [choice_completion_tokens(choice) for choice in choices]
+        if choices and all(
+            count is not None and count > 0 for count in completion_tokens
+        ):
             trajectory.metrics["completion_tokens"] = sum(
-                len(logprob.content or logprob.refusal or []) for logprob in logprobs
+                count for count in completion_tokens if count is not None
             )
     context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1

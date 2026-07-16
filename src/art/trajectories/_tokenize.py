@@ -893,6 +893,7 @@ def _legacy_tokenize(
     token_ids: list[int] = []
     logprobs: list[float] = []
     assistant_mask: list[bool] = []
+    sampled_spans: list[tuple[int, int]] = []
     for item in trajectory.messages_and_choices:
         if not isinstance(item, Choice):
             continue
@@ -912,7 +913,9 @@ def _legacy_tokenize(
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
             assistant_mask.extend([False] * len(suffix))
+        start = len(token_ids)
         token_ids.extend(completion)
+        sampled_spans.append((start, len(token_ids)))
         if len(completion_logprobs) != len(completion):
             completion_logprobs = [math.nan] * len(completion)
         logprobs.extend(completion_logprobs)
@@ -923,6 +926,7 @@ def _legacy_tokenize(
         token_ids=token_ids,
         logprobs=logprobs,
         assistant_mask=assistant_mask,
+        sampled_spans=sampled_spans,
         underlying=trajectory,
     )
 
@@ -960,6 +964,7 @@ def tokenize_one(
     token_ids: list[int] = []
     logprobs: list[float] = []
     assistant_mask: list[bool] = []
+    sampled_spans: list[tuple[int, int]] = []
     response_histories: dict[
         str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
     ] = {}
@@ -1055,7 +1060,9 @@ def tokenize_one(
             completion_logprobs = _align_visible_logprobs(
                 tokenizer, completion, exchange
             ) or [math.nan] * len(completion)
+        start = len(token_ids)
         token_ids.extend(completion)
+        sampled_spans.append((start, len(token_ids)))
         logprobs.extend(completion_logprobs)
         assistant_mask.extend([True] * len(completion))
 
@@ -1063,5 +1070,6 @@ def tokenize_one(
         token_ids=token_ids,
         logprobs=logprobs,
         assistant_mask=assistant_mask,
+        sampled_spans=sampled_spans,
         underlying=trajectory,
     )

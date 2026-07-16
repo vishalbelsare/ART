@@ -27,6 +27,18 @@ def ensure_reward_variance(groups) -> None:
             group.trajectories[1].reward = 0.0
 
 
+async def test_tinker_rollout_lease_pins_snapshot(tmp_path) -> None:
+    backend = TinkerNativeBackend(tinker_api_key="test", path=str(tmp_path))
+    model = art.TrainableModel(
+        run_name="lease-test",
+        name="lease-serving-model",
+        project="integration-tests",
+        base_model=DEFAULT_BASE_MODEL,
+    )
+    async with backend.adapter_lease(model, 3):
+        assert backend._model_inference_name(model) == "lease-serving-model@3"
+
+
 async def simple_rollout(
     client: openai.AsyncOpenAI, model_name: str, prompt: str
 ) -> art.Trajectory:
@@ -62,6 +74,7 @@ async def test_tinker_native_backend():
     with tempfile.TemporaryDirectory() as tmpdir:
         backend = TinkerNativeBackend(path=tmpdir)
         model = art.TrainableModel(
+            run_name=model_name,
             name=model_name,
             project="integration-tests",
             base_model=get_base_model(),
@@ -130,11 +143,13 @@ async def test_tinker_native_fork_checkpoint():
     with tempfile.TemporaryDirectory() as tmpdir:
         backend = TinkerNativeBackend(path=tmpdir)
         model_a = art.TrainableModel(
+            run_name=model_a_name,
             name=model_a_name,
             project="integration-tests",
             base_model=get_base_model(),
         )
         model_b = art.TrainableModel(
+            run_name=model_b_name,
             name=model_b_name,
             project="integration-tests",
             base_model=get_base_model(),

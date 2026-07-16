@@ -543,7 +543,7 @@ def test_gather_metrics_sum_legacy_and_exchange_completion_tokens() -> None:
     second.logprobs.content *= 2
     legacy = art.Trajectory(messages_and_choices=[first, second])
     record_metrics(GatherContext(), legacy)
-    assert legacy.metrics["completion_tokens"] == 3
+    assert "completion_tokens" not in legacy.metrics
 
 
 def test_gather_metrics_omit_partial_exchange_usage() -> None:

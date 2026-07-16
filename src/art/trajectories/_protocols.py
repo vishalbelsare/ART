@@ -15,6 +15,11 @@ from openai.types.responses import Response
 from pydantic import TypeAdapter, ValidationError
 
 from ..openai import init_chat_completion, update_chat_completion
+from ..preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
+from ..vllm_route_transport import (
+    decode_routed_experts_response,
+    is_routed_experts_response,
+)
 from . import (
     ChatCompletionsExchange,
     ChatCompletionsRequest,
@@ -76,6 +81,17 @@ def _sse_events(body: bytes) -> list[tuple[str | None, SSEPayload]]:
 
 def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
     if not stream:
+        if is_routed_experts_response(body):
+            response, routes = decode_routed_experts_response(body)
+            payload = response.model_dump(mode="python")
+            for position, choice in enumerate(response.choices):
+                attach_moe_routing_metadata_to_choice(
+                    choice=choice,
+                    response_payload=payload,
+                    choice_index=position,
+                    routed_experts=routes.get(int(choice.index)),
+                )
+            return response
         return ChatCompletion.model_validate_json(body)
     response: ChatCompletion | None = None
     choices: dict[int, ChatCompletion] = {}

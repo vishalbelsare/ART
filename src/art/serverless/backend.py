@@ -49,9 +49,9 @@ def _extract_step_from_wandb_artifact(artifact: "Artifact") -> int | None:
 
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "reward",
-    "reward_std_dev": "reward_std_dev",
-    "exception_rate": "exception_rate",
+    "reward": "train/reward",
+    "reward_std_dev": "train/reward_std_dev",
+    "exception_rate": "train/exception_rate",
     "policy_loss": "loss/train",
     "loss": "loss/train",
     "entropy": "loss/entropy",
@@ -62,8 +62,8 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
     "num_groups_submitted": "data/step_num_groups_submitted",
     "num_groups_trainable": "data/step_num_groups_trainable",
     "num_trajectories": "data/step_num_trajectories",
-    "num_trainable_tokens": "data/step_trainer_tokens",
-    "train_tokens": "data/step_trainer_tokens",
+    "num_trainable_tokens": "data/step_trainable_assistant_tokens",
+    "train_tokens": "data/step_trainable_assistant_tokens",
     "num_datums": "data/step_num_datums",
 }
 
@@ -74,7 +74,7 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric == "tokens_per_second":
         return ""
     if metric.startswith("group_metric_"):
-        return f"group_{metric[len('group_metric_') :]}"
+        return f"train/group/{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 
@@ -120,7 +120,7 @@ class ServerlessBackend:
         client_model = await self._client.models.create(  # ty:ignore[possibly-missing-attribute]
             entity=model.entity,
             project=model.project,
-            name=model.name,
+            name=model._storage_name(),
             base_model=model.base_model,
             return_existing=True,
         )
@@ -160,8 +160,10 @@ class ServerlessBackend:
         """
         assert model.entity is not None, "Model entity is required"
         if step is None:
-            step = pinned_inference_step(model.name)
-        base_name = f"wandb-artifact:///{model.entity}/{model.project}/{model.name}"
+            step = pinned_inference_step(model._storage_name())
+        base_name = (
+            f"wandb-artifact:///{model.entity}/{model.project}/{model._storage_name()}"
+        )
         if step is not None:
             return f"{base_name}:step{step}"
         return base_name
@@ -172,7 +174,16 @@ class ServerlessBackend:
         model: AnyTrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
-        async with pin_inference_step(model.name, step):
+        async with pin_inference_step(model._storage_name(), step):
+            yield
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with pin_inference_step(model._storage_name(), step):
             yield
 
     async def _get_step(self, model: "Model") -> int:
@@ -255,6 +266,7 @@ class ServerlessBackend:
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
+        optimizer_save_interval: int = 5,
         # Verbosity
         verbose: bool = False,
     ) -> ServerlessTrainResult:
@@ -320,6 +332,8 @@ class ServerlessBackend:
             save_checkpoint: Accepted for PipelineTrainer compatibility. Serverless
                 training currently always saves a trainable checkpoint for the next
                 inference step.
+            optimizer_save_interval: Accepted for PipelineTrainer compatibility;
+                serverless training owns optimizer checkpoint cadence.
             verbose: Whether to print verbose output. Defaults to False.
 
         Returns:
@@ -331,6 +345,7 @@ class ServerlessBackend:
             # Optionally log training metrics:
             # await model.log(metrics=result.metrics, step=result.step)
         """
+        del optimizer_save_interval
         groups_list = list(trajectory_groups)
         if loss_fn is None:
             resolved_loss_fn: Literal["cispo", "ppo"] = "ppo" if ppo else "cispo"
@@ -411,7 +426,9 @@ class ServerlessBackend:
         step = await self._get_step(model)
         artifact_name: str | None = None
         if model.entity is not None:
-            artifact_name = f"{model.entity}/{model.project}/{model.name}:step{step}"
+            artifact_name = (
+                f"{model.entity}/{model.project}/{model._storage_name()}:step{step}"
+            )
 
         # Record provenance on the latest W&B artifact
         wandb_run = model._get_wandb_run()
@@ -558,7 +575,7 @@ class ServerlessBackend:
 
         # Generate unique artifact name to avoid race conditions in distributed systems
         artifact_id = uuid.uuid4().hex[:12]
-        artifact_name = f"{model.name}-sft-data-{artifact_id}"
+        artifact_name = f"{model._storage_name()}-sft-data-{artifact_id}"
 
         if verbose:
             print("Serializing trajectories to file (streaming)...")
@@ -597,9 +614,8 @@ class ServerlessBackend:
             # Upload the file to W&B as a dataset artifact
             # Use the model's canonical run_id from database, or fall back to model name
             run = wandb_sdk.init(
-                name=model.name,
-                id=model.run_id
-                or model.name,  # Use stored run_id to match the canonical wandb run
+                name=model._storage_name(),
+                id=model.run_id or model._storage_name(),
                 entity=model.entity,
                 project=model.project,
                 resume="allow",  # Resume if this run already exists
@@ -758,7 +774,9 @@ class ServerlessBackend:
                 resolved_step = checkpoint.step
                 break
             else:
-                raise ValueError(f"No checkpoints found for model {model.name}")
+                raise ValueError(
+                    f"No checkpoints found for model {model._storage_name()}"
+                )
         else:
             resolved_step = step
 
@@ -767,9 +785,7 @@ class ServerlessBackend:
 
         # Download from W&B artifacts
         # The artifact name follows the pattern: {entity}/{project}/{model_name}:step{step}
-        artifact_name = (
-            f"{model.entity}/{model.project}/{model.name}:step{resolved_step}"
-        )
+        artifact_name = f"{model.entity}/{model.project}/{model._storage_name()}:step{resolved_step}"
 
         # Use wandb API to download (api was already created above for entity lookup)
         artifact = api.artifact(artifact_name, type="lora")
@@ -781,7 +797,7 @@ class ServerlessBackend:
                 tempfile.gettempdir(),
                 "art_checkpoints",
                 model.project,
-                model.name,
+                model._storage_name(),
                 f"{resolved_step:04d}",
             )
         else:
@@ -865,7 +881,7 @@ class ServerlessBackend:
 
             # Push to S3
             s3_path = build_s3_path(
-                model_name=model.name,
+                model_name=model._storage_name(),
                 project=model.project,
                 step=step,
                 s3_bucket=s3_bucket,
@@ -1010,19 +1026,22 @@ class ServerlessBackend:
         assert model.entity is not None, "Model entity is required"
 
         if verbose:
-            print(f"Uploading forked checkpoint as W&B artifact for {model.name}...")
+            print(
+                "Uploading forked checkpoint as W&B artifact for "
+                f"{model._storage_name()}..."
+            )
 
         wandb_sdk.login(key=self._client.api_key)
         run = wandb_sdk.init(
             project=model.project,
             entity=model.entity,
             job_type="checkpoint-fork",
-            name=f"fork-{from_model}-to-{model.name}",
+            name=f"fork-{from_model}-to-{model._storage_name()}",
             settings=wandb_sdk.settings(silent=True),
         )
         assert run is not None
 
-        dest_artifact = wandb_sdk.artifact(name=model.name, type="lora")
+        dest_artifact = wandb_sdk.artifact(name=model._storage_name(), type="lora")
         dest_artifact.add_dir(checkpoint_dir)
         aliases = ["latest"]
         if selected_step is not None:
@@ -1047,5 +1066,5 @@ class ServerlessBackend:
         if verbose:
             print(
                 f"Successfully forked checkpoint from {from_model} "
-                f"(step {selected_step}) to {model.name}"
+                f"(step {selected_step}) to {model._storage_name()}"
             )

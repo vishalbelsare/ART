@@ -8,6 +8,8 @@ from ...preprocessing.pack import DiskPackedTensors
 DEFAULT_TRAINING_LOG_PATH = "/tmp/megatron_training_log.jsonl"
 DEFAULT_JOBS_DIR = "/tmp/megatron_training_jobs"
 DEFAULT_VLLM_WAKE_LOCK_PATH = "/tmp/megatron_vllm_waking"
+LORA_READY_EVENT = "lora_ready"
+OPTIMIZER_READY_EVENT = "optimizer_ready"
 
 
 class MergedWeightTransferInitInfo(BaseModel):
@@ -26,6 +28,9 @@ class MergedWeightTransferSpec(BaseModel):
 
 
 class _MegatronTrainingJobBase(BaseModel):
+    step: int = Field(default=0, ge=0)
+    source_policy_step: int = Field(ge=0)
+    training_session_id: str
     lora_path: str
     allow_unvalidated_arch: bool = False
     optimizer_state_path: str
@@ -54,8 +59,19 @@ class MegatronSyncJob(BaseModel):
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
+class MegatronOptimizerSaveJob(BaseModel):
+    kind: Literal["save_optimizer"] = "save_optimizer"
+    step: int = Field(ge=0)
+    training_session_id: str
+    optimizer_state_path: str
+    log_path: str = DEFAULT_TRAINING_LOG_PATH
+
+
 class MegatronSFTTrainingJob(BaseModel):
     kind: Literal["sft"] = "sft"
+    step: int = Field(ge=0)
+    source_policy_step: int = Field(ge=0)
+    training_session_id: str
     lora_path: str
     allow_unvalidated_arch: bool = False
     optimizer_state_path: str
@@ -73,6 +89,7 @@ MegatronJob: TypeAlias = Annotated[
     MegatronTrainingJob
     | MegatronMergedTrainingJob
     | MegatronSyncJob
+    | MegatronOptimizerSaveJob
     | MegatronSFTTrainingJob,
     Field(discriminator="kind"),
 ]

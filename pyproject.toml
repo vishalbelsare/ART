@@ -13,7 +13,7 @@ dependencies = [
     "typing-extensions>=4.13",
     "typer>=0.15.2",
     "litellm>=1.71.1,<=1.82.0",
-    "weave>=0.52.24",
+    "weave>=0.52.41",
     "polars>=1.26.0",
     "tblib>=3.0.0",
     "nest-asyncio>=1.6.0",
@@ -49,6 +49,7 @@ backend = [
 megatron = [
     "numpy<2",
     "torch==2.11.0",
+    "torchvision==0.26.0",
     "flash-attn-4==4.0.0b5",
     "flashinfer-cubin==0.6.8.post1",
     "flashinfer-python==0.6.8.post1",
@@ -60,8 +61,9 @@ megatron = [
     "transformer-engine-torch==2.11.0",
     "megatron-core==0.17.0",
     "pybind11>=2.13.6",
+    "setuptools>=78.1.0",
     "megatron-bridge==0.4.0rc0",
-    "deep-ep==1.2.1 ; sys_platform == 'linux'",
+    "nvidia-cuda-cccl-cu12==12.9.27 ; sys_platform == 'linux'",
     "tilelang==0.1.10 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "causal-conv1d==1.6.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
     "mamba-ssm==2.3.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
@@ -69,6 +71,7 @@ megatron = [
     "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
     "transformers==5.12.1",
+    "scipy>=1.17.0",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]
 
@@ -141,6 +144,9 @@ exclude = [
     "**/*.pyc",
 ]
 
+[tool.ruff]
+extend-exclude = ["src/art/megatron/_hybrid_ep"]
+
 [tool.ruff.lint]
 select = ["I"]
 
@@ -176,14 +182,14 @@ override-dependencies = [
     "quack-kernels==0.3.7",
     "transformer-engine==2.11.0",
     "torch==2.11.0",
+    "torchvision==0.26.0",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
-no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "deep-ep", "nv-grouped-gemm"]
+no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "nv-grouped-gemm"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
-deep-ep = ["torch>=2.11.0"]
-megatron-core = ["pybind11"]
+megatron-core = ["pybind11", "setuptools"]
 nv-grouped-gemm = ["torch>=2.11.0"]
 transformer-engine-torch = ["torch>=2.11.0"]
 
@@ -195,11 +201,6 @@ transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
 name = "apex"
 version = "0.1"
 requires-dist = ["packaging"]
-
-[[tool.uv.dependency-metadata]]
-name = "deep-ep"
-version = "1.2.1+9af0e0d"
-requires-dist = []
 
 # Keep Bridge's runtime deps explicit here and let ART's megatron extra own the
 # Transformers pin validated by model-support handlers in this branch.
@@ -251,6 +252,9 @@ requires-dist = [
     "torch",
     "transformer-engine-cu12",
 ]
+
+[tool.ty.src]
+exclude = ["src/art/megatron/_hybrid_ep/**"]
 
 [tool.ty.environment]
 python-version = "3.12"
@@ -332,8 +336,8 @@ dev = [
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
-deep-ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "v1.2.1" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
 panza = { git = "https://github.com/corbt/panza.git" }

@@ -9,6 +9,7 @@ import math
 import random
 from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
 
+import numpy as np
 from openai.types.chat.chat_completion import Choice
 import torch
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
@@ -16,16 +17,24 @@ from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokeni
 if TYPE_CHECKING:
     from transformers.image_processing_utils import BaseImageProcessor
 
-from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
+from ..trajectories import (
+    ChatCompletionsExchange,
+    History,
+    Trajectory,
+    TrajectoryGroup,
+    get_messages,
+)
 from ..types import MessagesAndChoices
 from ..utils.chat_template import (
     default_chat_template_kwargs_for_tokenizer,
     merge_chat_template_kwargs,
 )
 from .moe_routing import (
+    MoeRouteArray,
+    MoeRouteSegments,
     MoeRoutingAlignmentStats,
-    TokenRoute,
     align_choice_routes_to_tokenized_result,
+    choice_moe_routing_metadata,
 )
 from .response_masking import (
     _TemplatePartTokenizer,
@@ -36,6 +45,24 @@ from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
+
+
+def _slice_moe_routes(
+    routes: MoeRouteArray | MoeRouteSegments | None, start: int
+) -> MoeRouteArray | MoeRouteSegments | None:
+    if routes is None:
+        return None
+    if isinstance(routes, MoeRouteSegments):
+        if start <= 0:
+            return routes
+        if start >= routes.shape[0]:
+            return np.empty((0, routes.shape[1], routes.shape[2]), dtype=np.int32)
+        return MoeRouteSegments(
+            segments=tuple(
+                segment for _, segment in routes.iter_slices(start, routes.shape[0])
+            )
+        )
+    return routes[start:]
 
 
 class _TokenDecoder(Protocol):
@@ -176,7 +203,7 @@ class TokenizedResult:
     choice_offsets: list[int]
     extra_logprobs: dict[str, list[float]]
     _tokenizer: _TokenDecoder = field(repr=False, compare=False)
-    moe_routed_experts: list[TokenRoute | None] | None = None
+    moe_routed_experts: MoeRouteArray | MoeRouteSegments | None = None
     moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
     weight: float = 0.0
     prompt_id: int = 0
@@ -208,10 +235,8 @@ class TokenizedResult:
                 key: values[self.prompt_length :]
                 for key, values in self.extra_logprobs.items()
             },
-            moe_routed_experts=(
-                self.moe_routed_experts[self.prompt_length :]
-                if self.moe_routed_experts is not None
-                else None
+            moe_routed_experts=_slice_moe_routes(
+                self.moe_routed_experts, self.prompt_length
             ),
             moe_routing_alignment_stats=self.moe_routing_alignment_stats,
             _tokenizer=self._tokenizer,
@@ -405,7 +430,7 @@ def _tokenized_result_from_vllm_choices(
     )
 
 
-def tokenize_vllm_trajectory_histories(
+def assemble_vllm_training_sequences(
     *,
     tokenizer: PreTrainedTokenizerBase,
     histories: list[History],
@@ -413,6 +438,7 @@ def tokenize_vllm_trajectory_histories(
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
 ) -> list[TokenizedResult]:
+    """Assemble pretokenized vLLM choices into append-compatible training sequences."""
     results: list[TokenizedResult] = []
     token_ids: list[int] = []
     assistant_mask: list[int] = []
@@ -526,7 +552,11 @@ def tokenize_trajectory_groups(
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             if trajectory.exchanges:
-                from ..trajectories._tokenize import _as_tokenizer, tokenize_one
+                from ..trajectories._tokenize import (
+                    _as_tokenizer,
+                    _exchange_list,
+                    tokenize_one,
+                )
 
                 exchange_result = tokenize_one(
                     trajectory,
@@ -547,12 +577,34 @@ def tokenize_trajectory_groups(
                     raise RuntimeError(
                         "Exchange trajectory is missing logprobs for trainable tokens"
                     )
-                choice_offsets = [
-                    index
-                    for index, trainable in enumerate(exchange_result.assistant_mask)
-                    if trainable
-                    and (index == 0 or not exchange_result.assistant_mask[index - 1])
+                exchanges = _exchange_list(trajectory, None)
+                chat_choices = [
+                    exchange.response.choices[0]
+                    for exchange in exchanges
+                    if isinstance(exchange, ChatCompletionsExchange)
                 ]
+                if len(chat_choices) == len(exchanges):
+                    moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
+                        token_ids=exchange_result.token_ids,
+                        choices=chat_choices,
+                        choice_offsets=[
+                            start for start, _ in exchange_result.sampled_spans
+                        ],
+                        choice_token_lengths=[
+                            end - start for start, end in exchange_result.sampled_spans
+                        ],
+                    )
+                else:
+                    if any(
+                        choice_moe_routing_metadata(choice) is not None
+                        for choice in chat_choices
+                    ):
+                        raise RuntimeError(
+                            "MoE routing replay requires an all-Chat-Completions "
+                            "exchange trajectory"
+                        )
+                    moe_routes = None
+                    moe_stats = MoeRoutingAlignmentStats()
                 trajectory_results = [
                     TokenizedResult(
                         advantage=advantage,
@@ -566,13 +618,17 @@ def tokenize_trajectory_groups(
                         pixel_values=None,
                         image_grid_thw=None,
                         trajectory=trajectory,
-                        choice_offsets=choice_offsets,
+                        choice_offsets=[
+                            start for start, _ in exchange_result.sampled_spans
+                        ],
                         extra_logprobs={},
+                        moe_routed_experts=moe_routes,
+                        moe_routing_alignment_stats=moe_stats,
                         _tokenizer=tokenizer,
                     )
                 ]
             else:
-                trajectory_results = tokenize_vllm_trajectory_histories(
+                trajectory_results = assemble_vllm_training_sequences(
                     tokenizer=tokenizer,
                     histories=[
                         History(
@@ -639,7 +695,7 @@ def tokenize_trajectory(
     Tokenizes a trajectory and returns a TokenizedResult.
     """
     del image_processor, chat_template_kwargs, chat_template_tool_schema_format
-    results = tokenize_vllm_trajectory_histories(
+    results = assemble_vllm_training_sequences(
         tokenizer=tokenizer,
         histories=[history],
         advantage=advantage,
@@ -651,7 +707,7 @@ def tokenize_trajectory(
     if len(results) > 1:
         raise RuntimeError(
             "History produced multiple non-append-only vLLM token sequences; "
-            "use tokenize_vllm_trajectory_histories to preserve split histories."
+            "use assemble_vllm_training_sequences to preserve split histories."
         )
     return results[0]
 
