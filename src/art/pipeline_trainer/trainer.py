@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 import inspect
@@ -56,9 +56,6 @@ from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
 
 PIPELINE_STATE_KEY = "_pipeline_trainer"
-_ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
-_ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
-_QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
 _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
@@ -285,12 +282,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
 
         self.state = PipelineState()
+        self._stop_event = asyncio.Event()
         self._scenario_lock = asyncio.Lock()
         self._scenario_iter: AsyncIterator[ScenarioT] | None = _to_async_iterator(
             scenarios
         )
         self._scenario_source_exhausted = False
         self._output_queue: asyncio.Queue[TrajectoryGroup | None] | None = None
+        self._producer_rollout_timings = (0.0, 0.0, 0.0)
+        self._reported_producer_rollout_timings = (0.0, 0.0, 0.0)
         self._eval_queue: asyncio.Queue[int] | None = None
         self._rollout_worker_controller = RolloutWorkerController(
             self, self.num_rollout_workers
@@ -467,28 +467,23 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""
-        if self.state.done:
-            return
         self.state.done = True
+        self._stop_event.set()
 
-        async def _notify_policy() -> None:
-            async with self.state.policy_updated:
-                self.state.policy_updated.notify_all()
-
+    async def _await_or_stop(self, awaitable: Awaitable[T]) -> tuple[bool, T | None]:
+        operation = asyncio.ensure_future(awaitable)
+        stop_wait = asyncio.create_task(self._stop_event.wait())
+        tasks = (operation, stop_wait)
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop is None:
-            return
-
-        loop.create_task(_notify_policy())
-        if self._output_queue is not None:
-            try:
-                self._output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                loop.create_task(self._output_queue.put(None))
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if operation in done:
+                return True, operation.result()
+            return False, None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _finalize_backend_training(self) -> None:
         if not self._backend_training_completed:
@@ -678,13 +673,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if self._scenario_source_exhausted:
                 return None
             try:
-                scenario = await anext(self._scenario_iter)
+                completed, scenario = await self._await_or_stop(
+                    anext(self._scenario_iter)
+                )
             except StopAsyncIteration:
                 self._scenario_source_exhausted = True
                 return None
+            if not completed:
+                return None
             self.state.scenario_offset += 1
             self.state.total_scenarios_consumed += 1
-            return scenario
+            return cast(ScenarioT, scenario)
 
     async def _wait_for_policy(self) -> None:
         if self.max_steps_off_policy is None:
@@ -695,7 +694,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 and self.state.policy_version
                 < self.state.next_training_step - self.max_steps_off_policy
             ):
-                await self.state.policy_updated.wait()
+                completed, _ = await self._await_or_stop(
+                    self.state.policy_updated.wait()
+                )
+                if not completed:
+                    return
 
     @asynccontextmanager
     async def _checkpoint_lease(self, step: int) -> AsyncIterator[None]:
@@ -830,9 +833,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if self.state.done:
                     break
                 queue_wait_s = await self._put_output_group(group)
-                group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
-                group.metadata[_QUEUE_WAIT_TIME_KEY] = queue_wait_s
-                group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
+                self._record_producer_rollout_timings(
+                    rollout_wall_s, actor_idle_s + queue_wait_s, queue_wait_s
+                )
             except asyncio.CancelledError:
                 raise
             except LocalServingUnavailableError:
@@ -855,10 +858,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             and self._output_queue is not None
         ):
             print("Scenario source exhausted; draining completed rollouts.")
-            try:
-                self._output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                await self._output_queue.put(None)
+            await self._await_or_stop(self._output_queue.put(None))
 
     async def _training_stage(self) -> None:
         if self._output_queue is None:
@@ -869,10 +869,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             current_step + self.max_steps if self.max_steps is not None else None
         )
         if stop_at_step is not None and current_step >= stop_at_step:
-            self.state.done = True
             self._persist_state(current_step)
-            async with self.state.policy_updated:
-                self.state.policy_updated.notify_all()
+            self.request_stop()
             return
         stop_after_batch = False
 
@@ -881,17 +879,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 break
             step_start = time.monotonic()
             collect_started = time.monotonic()
+            zero_variance_before = self.state.discarded_zero_variance_groups
             batch, discarded, saw_sentinel = await self._collect_batch(current_step)
             trainer_idle_s = time.monotonic() - collect_started
+            zero_variance_discarded = (
+                self.state.discarded_zero_variance_groups - zero_variance_before
+            )
+            dequeued_groups = len(batch) + discarded + zero_variance_discarded
             self.state.discarded_stale_groups += discarded
             if discarded:
                 self._status.note_stale(discarded)
             if not batch:
                 break
-
-            actor_wall_s, actor_idle_s, queue_wait_s = (
-                self._consume_batch_rollout_timings(batch)
-            )
 
             training_policy_step = current_step
             expected_step = current_step + 1
@@ -957,6 +956,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await self._run_checkpoint_retention(current_step)
 
                 step_seconds = time.monotonic() - step_start
+                actor_wall_s, actor_idle_s, queue_wait_s = (
+                    self._consume_producer_rollout_timings()
+                )
                 self._status.note_training_batch(
                     batch, step=current_step, step_seconds=step_seconds
                 )
@@ -973,6 +975,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "discarded/cum/stale_groups": stale_groups,
                     "discarded/cum/zero_variance_groups": zero_variance_groups,
                     "discarded/step/stale_groups": float(discarded),
+                    "discarded/step/zero_variance_groups": float(
+                        zero_variance_discarded
+                    ),
                     "discarded/rate/stale_groups": stale_groups
                     / max(generated_groups_cum, 1.0),
                     "discarded/rate/zero_variance_groups": zero_variance_groups
@@ -980,14 +985,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "time/step_wall_s": step_seconds,
                     "time/step_collect_batch_s": trainer_idle_s,
                     "time/step_trainer_idle_s": trainer_idle_s,
+                    "time/step_rollout_s": actor_wall_s,
+                    "time/step_rollout_idle_s": actor_idle_s,
+                    "queue/put_wait_s": queue_wait_s,
+                    "queue/put_wait_frac": queue_wait_s
+                    / max(queue_wait_s + actor_wall_s, 1e-9),
+                    "queue/actual_stale_fraction": discarded / max(dequeued_groups, 1),
                 }
                 metrics.setdefault("time/step_backend_train_s", train_call_elapsed)
-                if actor_wall_s > 0:
-                    metrics["time/step_rollout_s"] = actor_wall_s
-                if actor_idle_s > 0:
-                    metrics["time/step_rollout_idle_s"] = actor_idle_s
-                if queue_wait_s > 0 and actor_wall_s > 0:
-                    metrics["queue/put_wait_frac"] = queue_wait_s / actor_wall_s
                 metrics.update(result.metrics)
                 attachment_metrics, attachment_owns_vllm_metrics = (
                     self._collect_attachment_train_step_metrics()
@@ -1043,10 +1048,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_after_batch:
                 break
 
-        self.state.done = True
         self._persist_state(current_step)
-        async with self.state.policy_updated:
-            self.state.policy_updated.notify_all()
+        self.request_stop()
 
     async def _collect_batch(
         self, current_step: int
@@ -1057,7 +1060,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         saw_sentinel = False
 
         while len(batch) < self.min_batch_size:
-            item = await self._output_queue.get()
+            completed, item = await self._await_or_stop(self._output_queue.get())
+            if not completed:
+                saw_sentinel = True
+                break
             if item is None:
                 saw_sentinel = True
                 break
@@ -1107,11 +1113,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
 
         pending_eval: asyncio.Task[None] | None = None
-        while not self.state.done or not self._eval_queue.empty():
+        while True:
             try:
-                step = await asyncio.wait_for(self._eval_queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+                step = self._eval_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self.state.done:
+                    break
+                completed, step = await self._await_or_stop(self._eval_queue.get())
+                if not completed:
+                    continue
+            assert step is not None
 
             if pending_eval is not None and not pending_eval.done():
                 try:
@@ -1131,7 +1142,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         sleep_seconds = min(1.0, max(0.2, self._status_log_interval_seconds / 10))
         while not self.state.done:
             self._status.log_if_due()
-            await asyncio.sleep(sleep_seconds)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=sleep_seconds)
+            except asyncio.TimeoutError:
+                continue
 
     async def _run_eval(self, step: int) -> None:
         assert self.eval_fn is not None
@@ -1304,7 +1318,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if self._collapse_triggered:
             return
         self._collapse_triggered = True
-        self.state.done = True
+        self.request_stop()
         print(
             "\n"
             "========================================\n"
@@ -1813,30 +1827,27 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _put_output_group(self, group: TrajectoryGroup) -> float:
         assert self._output_queue is not None
         queue_wait_started = time.monotonic()
-        while not self.state.done:
-            try:
-                await asyncio.wait_for(self._output_queue.put(group), timeout=1.0)
-                self._status.note_group_enqueued(group)
-                return time.monotonic() - queue_wait_started
-            except asyncio.TimeoutError:
-                continue
+        completed, _ = await self._await_or_stop(self._output_queue.put(group))
+        if completed:
+            self._status.note_group_enqueued(group)
         return time.monotonic() - queue_wait_started
 
-    def _consume_batch_rollout_timings(
-        self, batch: list[TrajectoryGroup]
-    ) -> tuple[float, float, float]:
-        rollout_wall_s = 0.0
-        actor_idle_s = 0.0
-        queue_wait_s = 0.0
-        for group in batch:
-            rollout_wall_s += self._pop_float_metadata(group, _ROLLOUT_WALL_TIME_KEY)
-            actor_idle_s += self._pop_float_metadata(group, _ACTOR_IDLE_TIME_KEY)
-            queue_wait_s += self._pop_float_metadata(group, _QUEUE_WAIT_TIME_KEY)
-        return rollout_wall_s, actor_idle_s, queue_wait_s
+    def _record_producer_rollout_timings(
+        self, rollout_wall_s: float, actor_idle_s: float, queue_wait_s: float
+    ) -> None:
+        previous = self._producer_rollout_timings
+        self._producer_rollout_timings = (
+            previous[0] + rollout_wall_s,
+            previous[1] + actor_idle_s,
+            previous[2] + queue_wait_s,
+        )
 
-    @staticmethod
-    def _pop_float_metadata(group: TrajectoryGroup, key: str) -> float:
-        value = group.metadata.pop(key, 0.0)
-        if isinstance(value, (int, float)):
-            return float(value)
-        return 0.0
+    def _consume_producer_rollout_timings(self) -> tuple[float, float, float]:
+        current = self._producer_rollout_timings
+        previous = self._reported_producer_rollout_timings
+        self._reported_producer_rollout_timings = current
+        return (
+            max(0.0, current[0] - previous[0]),
+            max(0.0, current[1] - previous[1]),
+            max(0.0, current[2] - previous[2]),
+        )

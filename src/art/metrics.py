@@ -114,10 +114,22 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         dashboard_default=True,
     ),
     MetricDefinition(
+        key="data/step_executed_packed_train_tokens",
+        title="Megatron executed packed train tokens",
+        description=(
+            "packed token rows included in Megatron throughput; CP excludes "
+            "configured packed-row padding that is not dispatched"
+        ),
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
         key="throughput/train_packed_tok_per_s",
         title="Megatron packed train tokens per second",
         description=(
-            "physical packed training-token throughput reported by the Megatron worker"
+            "physical training-token throughput reported by the Megatron worker; "
+            "CP excludes configured packed-row padding that is not dispatched"
         ),
         kind="rate",
         unit="tok/s",
@@ -274,6 +286,30 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         title="Predicted stale queue fraction",
         description="fraction of queued groups predicted stale for the next train step",
         kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="queue/actual_stale_fraction",
+        title="Actual stale dequeue fraction",
+        description="stale groups divided by all groups dequeued for this train step",
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="queue/put_wait_frac",
+        title="Completed queue wait fraction",
+        description=(
+            "worker queue-put wait divided by queue-put wait plus rollout time"
+        ),
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="queue/put_wait_s",
+        title="Completed queue wait",
+        description="worker-seconds spent waiting to enqueue completed rollout groups",
+        kind="duration",
+        unit="seconds",
         higher_is_better=False,
     ),
 )
