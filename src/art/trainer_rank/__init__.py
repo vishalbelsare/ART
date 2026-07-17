@@ -550,6 +550,10 @@ class TrainerRank:
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}
+        self._pending_hybridep_graphs: list[weakref.ReferenceType[torch.Tensor]] = []
+        self._hybridep_graph_tracking = False
+        self._hybridep_buffer_id: int | None = None
+        self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
@@ -985,15 +989,24 @@ class TrainerRank:
                 f"installed LoRA wrapper sites: {preview}{more}. Configure the "
                 "Megatron runtime with matching LoRA target modules before loading."
             )
+        local_state = {
+            key: tensor for key, tensor in adapter_model.items() if key in templates
+        }
+        adapter_model = (
+            self.runtime.model_support_handler.canonicalize_loaded_lora_state(
+                local_state, self.runtime.model
+            )
+        )
+        if set(adapter_model) != set(local_state):
+            raise TrainerRankSlotStateError(
+                "Model-specific LoRA canonicalization changed the adapter key set "
+                f"for {kind} slot {name!r}."
+            )
         return {
-            key: (
-                tensor.to(
-                    device=templates[key].device,
-                    dtype=templates[key].dtype,
-                    non_blocking=True,
-                )
-                if key in templates
-                else tensor
+            key: tensor.to(
+                device=templates[key].device,
+                dtype=templates[key].dtype,
+                non_blocking=True,
             )
             for key, tensor in adapter_model.items()
         }
@@ -1153,6 +1166,9 @@ class TrainerRank:
         params: AdamParams,
         scale_grads: float,
     ) -> dict[str, float]:
+        self.runtime.model_support_handler.zero_internal_padding_grads(
+            self.runtime.model
+        )
         selected = []
         for name in checkpoint_names:
             self._guard_checkpoint_can_step(name)
@@ -1299,7 +1315,85 @@ class TrainerRank:
                         f"{name!r} has shape {tuple(value.shape)}, but the loaded "
                         f"slot parameter has shape {tuple(param.shape)}."
                     )
+        self._zero_dynamic_optimizer_padding(name, dynamic)
         return dynamic
+
+    def _zero_dynamic_optimizer_padding(
+        self,
+        name: str,
+        dynamic: _DynamicOptimizer,
+    ) -> None:
+        masks = self._dynamic_optimizer_padding_masks(name)
+        with torch.no_grad():
+            for param, mask in zip(dynamic.master_params, masks, strict=True):
+                param.masked_fill_(mask, 0)
+                for value in dynamic.optimizer.state.get(param, {}).values():
+                    if isinstance(value, torch.Tensor) and value.shape == param.shape:
+                        value.masked_fill_(mask, 0)
+
+    def _dynamic_optimizer_padding_masks(self, name: str) -> tuple[torch.Tensor, ...]:
+        params = self._checkpoint_slot_params_by_name[name]
+        masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in params)
+        param_indices = {id(param): index for index, param in enumerate(params)}
+        exported: dict[str, torch.Tensor] = {}
+        owners: dict[str, tuple[int, int | None]] = {}
+        mapped_indices: set[int] = set()
+        ref = self._slot_ref("checkpoint", name)
+
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                lora_params = getattr(module, "_lora_params", None)
+                expected_keys = getattr(module, "_expected_weight_keys", None)
+                if not callable(lora_params) or not callable(expected_keys):
+                    continue
+                for suffix, param in lora_params(ref):
+                    index = param_indices.get(id(param))
+                    if index is None:
+                        continue
+                    mapped_indices.add(index)
+                    keys = expected_keys(str(suffix).removesuffix(".weight"))
+                    if int(param.ndim) == 3:
+                        if len(keys) != int(param.shape[0]):
+                            raise TrainerRankSlotStateError(
+                                f"Cannot map optimizer padding for checkpoint slot "
+                                f"{name!r}: {len(keys)} adapter keys describe "
+                                f"{int(param.shape[0])} local experts."
+                            )
+                        for expert, key in enumerate(keys):
+                            exported[str(key)] = torch.ones_like(param[expert].T)
+                            owners[str(key)] = (index, expert)
+                    else:
+                        if len(keys) != 1:
+                            raise TrainerRankSlotStateError(
+                                f"Cannot map optimizer padding for checkpoint slot "
+                                f"{name!r}: expected one adapter key, got {len(keys)}."
+                            )
+                        key = str(keys[0])
+                        exported[key] = torch.ones_like(param.T)
+                        owners[key] = (index, None)
+
+        if mapped_indices and (
+            missing := sorted(set(range(len(params))) - mapped_indices)
+        ):
+            raise TrainerRankSlotStateError(
+                f"Cannot map optimizer padding for checkpoint slot {name!r}: "
+                f"parameter indices {missing} do not belong to installed LoRA sites."
+            )
+
+        canonical = self.runtime.model_support_handler.canonicalize_loaded_lora_state(
+            exported, self.runtime.model
+        )
+        for key, value in canonical.items():
+            owner = owners.get(key)
+            if owner is None or not isinstance(value, torch.Tensor):
+                continue
+            index, expert = owner
+            mask = value.T == 0
+            if expert is None:
+                masks[index].copy_(mask)
+            else:
+                masks[index][expert].copy_(mask)
+        return masks
 
     def _reduce_dynamic_grads(
         self,
@@ -1657,15 +1751,33 @@ class TrainerRank:
         outputs = [
             ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
         ]
-        for group in plan.groups:
-            from art.megatron.lora import use_lora_slot
+        self._validate_hybridep_topology()
+        hybridep = (
+            self._configure_hybridep(
+                tuple(group.packed for group in plan.groups), topology=self._topology()
+            )
+            if plan.groups
+            else None
+        )
+        try:
+            for group_index, group in enumerate(plan.groups):
+                from art.megatron.lora import use_lora_slot
 
-            with use_lora_slot(group.slot_ref):
-                prepared = self._prepare_packed_forward(group.packed)
-                item_outputs = self._forward_packed(group.items, prepared)
-            item_outputs = self._track_slot_graph_outputs(group.slot_ref, item_outputs)
-            for index, output in zip(group.request_indices, item_outputs, strict=True):
-                outputs[index] = output
+                if hybridep is not None:
+                    self._set_hybridep_rows(hybridep[0][group_index])
+                with use_lora_slot(group.slot_ref):
+                    prepared = self._prepare_packed_forward(group.packed)
+                    item_outputs = self._forward_packed(group.items, prepared)
+                item_outputs = self._track_slot_graph_outputs(
+                    group.slot_ref, item_outputs
+                )
+                for index, output in zip(
+                    group.request_indices, item_outputs, strict=True
+                ):
+                    outputs[index] = output
+        finally:
+            if hybridep is not None:
+                self._set_hybridep_rows(hybridep[1])
         return outputs
 
     def _track_slot_graph_outputs(
@@ -1673,7 +1785,9 @@ class TrainerRank:
         ref: "LoRASlotRef | None",
         outputs: Sequence[AnyForwardOutput],
     ) -> list[AnyForwardOutput]:
-        if ref is None or ref.name is None:
+        track_slot = ref is not None and ref.name is not None
+        track_hybridep = bool(getattr(self, "_hybridep_graph_tracking", False))
+        if not track_slot and not track_hybridep:
             return list(outputs)
 
         marker: torch.Tensor | None = None
@@ -1703,8 +1817,24 @@ class TrainerRank:
             for output in outputs
         ]
         if marker is not None:
-            self._slot_graphs().setdefault(ref, []).append(weakref.ref(marker))
+            marker_ref = weakref.ref(marker)
+            if track_slot:
+                self._slot_graphs().setdefault(ref, []).append(marker_ref)
+            if track_hybridep:
+                self._hybridep_graphs().append(marker_ref)
         return tracked_outputs
+
+    def _hybridep_graphs(self) -> list[weakref.ReferenceType[torch.Tensor]]:
+        graphs = getattr(self, "_pending_hybridep_graphs", None)
+        if graphs is None:
+            graphs = []
+            self._pending_hybridep_graphs = graphs
+        return graphs
+
+    def _has_live_hybridep_graphs(self) -> bool:
+        graphs = self._hybridep_graphs()
+        graphs[:] = [marker for marker in graphs if marker() is not None]
+        return bool(graphs)
 
     def _slot_graphs(
         self,
@@ -2338,6 +2468,10 @@ class TrainerRank:
         if int(topology.cp) > 1:
             return self._prepare_context_parallel_forward(batch, topology=topology)
         from art.megatron.prefix_tree_state import create_prefix_tree_state
+        from art.megatron.training.microbatches import (
+            _art_flex_sliding_windows,
+            _gdn_planner_config_for_provider,
+        )
 
         handler = self.runtime.model_support_handler
         provider = self.runtime.provider
@@ -2348,9 +2482,13 @@ class TrainerRank:
                 group_ids=batch.group_ids,
                 parent_ids=batch.parent_ids,
                 target_device=self.device,
+                input_pos=batch.position_ids,
+                sliding_windows=_art_flex_sliding_windows(provider),
                 build_gdn_execution_spec=handler.build_gdn_execution_spec,
+                model_support_handler=handler,
                 attention_head_dim=provider.kv_channels,
                 attention_value_head_dim=provider.kv_channels,
+                gdn_planner_config=_gdn_planner_config_for_provider(provider, handler),
             ),
             packed_seq_params=None,
             positions_by_item=batch.positions_by_sequence,
@@ -2363,6 +2501,125 @@ class TrainerRank:
                 for positions in batch.positions_by_sequence
             ),
         )
+
+    def _configure_hybridep(
+        self,
+        batches: Sequence[PrefixTreePack],
+        *,
+        topology: "ParallelTopology",
+    ) -> tuple[tuple[int, ...], int] | None:
+        from megatron.core import parallel_state as ps
+
+        expert_parallel_size = int(ps.get_expert_model_parallel_world_size())
+        if expert_parallel_size <= 1:
+            self._hybridep_graph_tracking = False
+            return None
+        self._validate_hybridep_topology(topology)
+        if not batches:
+            return None
+        from megatron.core.transformer.moe import fused_a2a
+
+        from art.megatron.train import (
+            _ensure_hybridep_capacity,
+            _hybridep_token_capacity,
+        )
+
+        padded = tuple(
+            _pad_packed_batch(batch, multiple=int(topology.tp)) for batch in batches
+        )
+        sequence_length = max(int(batch.tokens.shape[1]) for batch in padded)
+        rows = tuple(self._hybridep_rows(batch, topology=topology) for batch in padded)
+        current = fused_a2a._hybrid_ep_buffer
+        live = self._has_live_hybridep_graphs()
+        required_capacity = _hybridep_token_capacity(sequence_length, int(topology.cp))
+        if live and (
+            current is None
+            or id(current) != getattr(self, "_hybridep_buffer_id", None)
+            or int(current.configurer.buffer_config.max_num_of_tokens_per_rank)
+            < required_capacity
+        ):
+            raise TrainerRankSlotStateError(
+                "Cannot grow or replace the HybridEP buffer while an earlier "
+                "TrainerRank forward still has a live backward graph. Finish "
+                "backward or release those outputs before forwarding a larger batch."
+            )
+        _ensure_hybridep_capacity(
+            self.runtime,
+            packed_sequence_length=sequence_length,
+            context_parallel_size=int(topology.cp),
+        )
+        current = fused_a2a._hybrid_ep_buffer
+        if current is None:
+            raise RuntimeError("HybridEP buffer was not initialized")
+        if live:
+            high_water = max(*rows, int(getattr(self, "_hybridep_rows_high_water", 0)))
+        else:
+            high_water = max(rows)
+        self._hybridep_buffer_id = id(current)
+        self._hybridep_rows_high_water = high_water
+        self._hybridep_graph_tracking = True
+        return rows, high_water
+
+    def _validate_hybridep_topology(
+        self,
+        topology: "ParallelTopology | None" = None,
+    ) -> None:
+        if topology is None:
+            configured_ep = int(
+                getattr(self.runtime.provider, "expert_model_parallel_size", 1) or 1
+            )
+            if configured_ep <= 1:
+                return
+            topology = self._topology()
+        if int(topology.dp) > 1:
+            raise NotImplementedError(
+                "TrainerRank does not support combining data parallelism with "
+                "expert parallelism because uneven DP inputs can desynchronize "
+                "HybridEP collectives. For MoE models, use DP=1 with CP and EP "
+                "set to the world size."
+            )
+
+    @staticmethod
+    def _set_hybridep_rows(rows: int) -> None:
+        from art.megatron.train import _set_hybridep_token_count
+
+        _set_hybridep_token_count(rows)
+
+    def _hybridep_rows(
+        self,
+        batch: PrefixTreePack,
+        *,
+        topology: "ParallelTopology",
+    ) -> int:
+        sequence_length = int(batch.tokens.shape[1])
+        if int(topology.cp) <= 1:
+            return sequence_length
+        if int(topology.cp) > 1:
+            from art.megatron.context_parallel.runtime import (
+                context_parallel_rank_model_token_counts,
+            )
+            from art.megatron.training.microbatches import (
+                _context_parallel_config_for_provider,
+                _gdn_planner_config_for_provider,
+            )
+
+            handler = self.runtime.model_support_handler
+            return max(
+                context_parallel_rank_model_token_counts(
+                    group_ids=batch.group_ids,
+                    parent_ids=batch.parent_ids,
+                    topology=topology,
+                    config=_context_parallel_config_for_provider(
+                        self.runtime.provider, self.device
+                    ),
+                    original_seq_len=sequence_length,
+                    build_gdn_execution_spec=handler.build_gdn_execution_spec,
+                    gdn_planner_config=_gdn_planner_config_for_provider(
+                        self.runtime.provider, handler
+                    ),
+                )
+            )
+        raise AssertionError("unreachable")
 
     def _prepare_context_parallel_forward(
         self,

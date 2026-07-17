@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -284,6 +285,76 @@ def _assert_distributed_optimizer_restore(device: torch.device) -> None:
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
+def test_restored_dynamic_optimizer_canonicalizes_internal_padding() -> None:
+    with _single_rank_model_parallel():
+        for num_local_experts in (1, 2):
+            _assert_restored_dynamic_optimizer_canonicalizes_internal_padding(
+                num_local_experts
+            )
+
+
+def _assert_restored_dynamic_optimizer_canonicalizes_internal_padding(
+    num_local_experts: int,
+) -> None:
+    device = torch.device("cuda")
+    ref = LoRASlotRef("checkpoint", "A")
+    prefix = "dense" if num_local_experts == 1 else "experts.{expert}"
+    adapter = {
+        key: value
+        for expert in range(num_local_experts)
+        for key, value in _adapter(
+            prefix.format(expert=expert), rank=2, seed=17 + expert
+        ).items()
+    }
+    lora = LoRA(
+        prefix,
+        4,
+        5,
+        2,
+        32,
+        torch.float32,
+        device,
+        num_local_experts=num_local_experts,
+    )
+    lora.load_lora_slot(ref, adapter, requires_grad=True)
+    trainer = _trainer_for(lora, device)
+
+    def canonicalize(
+        state: dict[str, torch.Tensor], _model: object
+    ) -> dict[str, torch.Tensor]:
+        result = {key: value.clone() for key, value in state.items()}
+        for value in result.values():
+            value[..., -1] = 0
+        return result
+
+    trainer.runtime.model_support_handler.canonicalize_loaded_lora_state = canonicalize
+    for param in trainer._checkpoint_slot_params_by_name["A"]:
+        param.grad = torch.ones_like(param)
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-3, weight_decay=0.1, grad_clip_norm=0.0),
+        checkpoints=["A"],
+    )
+    state = trainer.checkpoint_slot_optimizer_state("A")
+    assert state is not None
+    masks = trainer._dynamic_optimizer_padding_masks("A")
+    masters = cast(tuple[torch.Tensor, ...], state["master_params"])
+    optimizer = cast(dict[str, object], state["optimizer"])
+    optimizer_states = cast(dict[int, dict[str, object]], optimizer["state"])
+    for index, (master, mask) in enumerate(zip(masters, masks, strict=True)):
+        master.masked_fill_(mask.cpu(), 5)
+        for value in optimizer_states[index].values():
+            if isinstance(value, torch.Tensor) and value.shape == master.shape:
+                value.masked_fill_(mask.cpu(), 5)
+
+    restored = trainer._restore_dynamic_optimizer("A", state)
+    for master, mask in zip(restored.master_params, masks, strict=True):
+        assert torch.count_nonzero(master[mask]) == 0
+        for value in restored.optimizer.state[master].values():
+            if isinstance(value, torch.Tensor) and value.shape == master.shape:
+                assert torch.count_nonzero(value[mask]) == 0
+
+
 def _local_shard(full: torch.Tensor, rank: int, size: int) -> torch.Tensor:
     return full[:, rank * size : (rank + 1) * size].clone().requires_grad_()
 
@@ -388,7 +459,15 @@ def _assert_reload_replaces_slot_optimizer(
 
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer = TrainerRank.__new__(TrainerRank)
-    trainer.runtime = SimpleNamespace(model=[lora], optimizer=None)
+    trainer.runtime = SimpleNamespace(
+        model=[lora],
+        optimizer=None,
+        model_support_handler=SimpleNamespace(
+            canonicalize_loaded_lora_state=lambda state, _model: state,
+            zero_internal_padding_grads=lambda _model: None,
+            zero_internal_padding_params=lambda _model: None,
+        ),
+    )
     trainer.device = device
     trainer._slot_stack = []
     trainer._default_slot_ref = None
