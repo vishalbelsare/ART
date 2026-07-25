@@ -53,29 +53,65 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
         assert route in source
 
 
-def test_runtime_patch_always_returns_token_ids(
+def test_runtime_patch_defaults_evidence_on_and_honors_opt_out(
     artifact_dir: Path,
 ) -> None:
     payload = _runtime_python(
         "import json; "
-        "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
-        "apply_vllm_runtime_patches(); "
+        "from art_vllm_runtime.patches import subclass_chat_completion_request; "
+        "subclass_chat_completion_request(); "
         "from vllm.entrypoints.openai.chat_completion import protocol; "
-        "request = protocol.ChatCompletionRequest("
+        "default_request = protocol.ChatCompletionRequest("
         "model='m', messages=[{'role': 'user', 'content': 'x'}]"
         "); "
+        "explicit_false = protocol.ChatCompletionRequest("
+        "model='m', messages=[{'role': 'user', 'content': 'x'}], "
+        "logprobs=False, top_logprobs=None, return_token_ids=False"
+        "); "
+        "explicit_none = protocol.ChatCompletionRequest("
+        "model='m', messages=[{'role': 'user', 'content': 'x'}], "
+        "return_token_ids=None"
+        "); "
         "print(json.dumps({"
-        "'logprobs': request.logprobs, "
-        "'top_logprobs': request.top_logprobs, "
-        "'return_token_ids': request.return_token_ids"
+        "'default': {"
+        "'logprobs': default_request.logprobs, "
+        "'top_logprobs': default_request.top_logprobs, "
+        "'return_token_ids': default_request.return_token_ids"
+        "}, "
+        "'default_fields_set': sorted(default_request.model_fields_set), "
+        "'explicit_false': {"
+        "'logprobs': explicit_false.logprobs, "
+        "'top_logprobs': explicit_false.top_logprobs, "
+        "'return_token_ids': explicit_false.return_token_ids"
+        "}, "
+        "'explicit_false_fields_set': sorted(explicit_false.model_fields_set), "
+        "'explicit_none_return_token_ids': explicit_none.return_token_ids, "
+        "'explicit_none_fields_set': sorted(explicit_none.model_fields_set)"
         "}))",
         artifact_dir,
         "route_token_ids",
     )
-    assert json.loads(payload) == {
-        "logprobs": True,
-        "top_logprobs": 0,
-        "return_token_ids": True,
+    assert json.loads(payload.splitlines()[-1]) == {
+        "default": {
+            "logprobs": True,
+            "top_logprobs": 0,
+            "return_token_ids": True,
+        },
+        "default_fields_set": ["messages", "model"],
+        "explicit_false": {
+            "logprobs": False,
+            "top_logprobs": None,
+            "return_token_ids": False,
+        },
+        "explicit_false_fields_set": [
+            "logprobs",
+            "messages",
+            "model",
+            "return_token_ids",
+            "top_logprobs",
+        ],
+        "explicit_none_return_token_ids": None,
+        "explicit_none_fields_set": ["messages", "model", "return_token_ids"],
     }
 
 

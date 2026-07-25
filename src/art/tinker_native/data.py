@@ -10,14 +10,14 @@ from tinker_cookbook import renderers
 import torch
 
 from ..trajectories import (
-    History,
+    LegacyHistory,
     TokenFlag,
-    TokenizedTrajectory,
+    TokenizedHistory,
     Trajectory,
     TrajectoryGroup,
     get_messages,
-    tokenize_trajectory,
 )
+from ..trajectories._selection import ModelSelector, resolve_training_model
 from ..types import MessagesAndChoices
 
 
@@ -143,6 +143,7 @@ def trajectory_groups_to_datums(
     normalize_advantages: bool = True,
     *,
     base_model: str | None = None,
+    model: ModelSelector | str | None = None,
 ) -> list[tinker.Datum]:
     datums: list[tinker.Datum] = []
 
@@ -163,11 +164,32 @@ def trajectory_groups_to_datums(
             continue
         for trajectory, advantage in zip(group.trajectories, advantages):
             if trajectory.exchanges:
-                datum = _tokenized_trajectory_to_datum(
-                    tokenize_trajectory(trajectory, base_model=base_model), advantage
+                from ..trajectories._tokenize import (
+                    _as_tokenizer,
+                    _first_introduction_mask,
+                    _SampledSourceKey,
+                    _tokenize_trajectory_with_trace,
                 )
-                if datum is not None:
-                    datums.append(datum)
+
+                selected_model = resolve_training_model(trajectory, model)
+                tokenized, traces = _tokenize_trajectory_with_trace(
+                    trajectory,
+                    model=selected_model,
+                    base_model=base_model,
+                    tokenizer=_as_tokenizer(tokenizer)
+                    if tokenizer is not None
+                    else None,
+                )
+                seen_source_keys: set[_SampledSourceKey] = set()
+                for history, trace in zip(tokenized.histories, traces, strict=True):
+                    trainable = _first_introduction_mask(
+                        trace.source_keys, seen_source_keys
+                    )
+                    datum = _tokenized_trajectory_to_datum(
+                        history, advantage, trainable=trainable
+                    )
+                    if datum is not None:
+                        datums.append(datum)
                 continue
             for history in iter_trajectory_histories(trajectory):
                 datum = history_to_datum(history, advantage, renderer, tokenizer)
@@ -177,8 +199,8 @@ def trajectory_groups_to_datums(
     return datums
 
 
-def iter_trajectory_histories(trajectory: Trajectory) -> Iterable[History]:
-    yield History(
+def iter_trajectory_histories(trajectory: Trajectory) -> Iterable[LegacyHistory]:
+    yield LegacyHistory(
         messages_and_choices=trajectory.messages_and_choices,
         tools=trajectory.tools,
     )
@@ -222,7 +244,7 @@ def extract_logprobs_from_choice(
 
 
 def history_to_datum(
-    history: History,
+    history: LegacyHistory,
     advantage: float,
     renderer: Any,
     tokenizer: Any,
@@ -283,17 +305,31 @@ def build_datum(
 
 
 def _tokenized_trajectory_to_datum(
-    tokenized: TokenizedTrajectory, advantage: float
+    tokenized: TokenizedHistory,
+    advantage: float,
+    *,
+    trainable: list[bool] | None = None,
 ) -> tinker.Datum | None:
-    sampled = [bool(flag & TokenFlag.SAMPLED) for flag in tokenized.flags]
-    if not (len(tokenized.token_ids) == len(tokenized.logprobs) == len(sampled)):
+    if trainable is None:
+        trainable = [bool(flag & TokenFlag.SAMPLED) for flag in tokenized.flags]
+    if not (
+        len(tokenized.token_ids)
+        == len(tokenized.logprobs)
+        == len(tokenized.flags)
+        == len(trainable)
+    ):
         raise ValueError("Tokenized trajectory fields differ in length")
-    if len(tokenized.token_ids) < 2 or not any(sampled):
-        return None
-    if sampled[0]:
+    if any(
+        selected and not flag & TokenFlag.SAMPLED
+        for selected, flag in zip(trainable, tokenized.flags, strict=True)
+    ):
+        raise ValueError("Only sampled tokens can be selected for Tinker training")
+    if trainable and trainable[0]:
         raise ValueError("A trainable trajectory cannot start with a sampled token")
+    if len(tokenized.token_ids) < 2 or not any(trainable):
+        return None
 
-    action_mask = sampled[1:]
+    action_mask = trainable[1:]
     if any(
         trainable and math.isnan(logprob)
         for trainable, logprob in zip(action_mask, tokenized.logprobs[1:], strict=True)

@@ -4,16 +4,18 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Generator
 import copy
 from datetime import datetime, timedelta
+import gzip
 import json
 from typing import Any, cast
 from unittest.mock import Mock
+import zlib
 
 import aiohttp
 from aiohttp import web
 from anthropic import AsyncAnthropic
 from anthropic.types import TextBlock
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAI
 import pytest
 import pytest_asyncio
 import requests
@@ -111,7 +113,13 @@ RESPONSE: dict[str, Any] = {
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": 5,
     },
-    "raw_output_tokens": [{"token_id": 2, "logprob": -0.2}],
+    "token_generations": [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2, "text": "hello"}],
+            "output_indices": [0],
+        }
+    ],
 }
 
 MESSAGE: dict[str, Any] = {
@@ -123,9 +131,37 @@ MESSAGE: dict[str, Any] = {
     "stop_reason": "end_turn",
     "stop_sequence": None,
     "usage": {"input_tokens": 1, "output_tokens": 1},
+    "prompt_token_ids": [1],
     "token_ids": [2],
     "logprobs": [-0.2],
 }
+
+
+class _SyncChunks(httpx.SyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __iter__(self) -> Generator[bytes, None, None]:
+        for index in range(0, len(self.body), 3):
+            yield self.body[index : index + 3]
+
+
+class _AsyncChunks(httpx.AsyncByteStream):
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for index in range(0, len(self.body), 3):
+            yield self.body[index : index + 3]
+
+
+def _encoded(body: bytes, encoding: str) -> bytes:
+    if encoding == "gzip":
+        return gzip.compress(body)
+    if encoding == "deflate":
+        return zlib.compress(body)
+    brotli = pytest.importorskip("brotli")
+    return cast(bytes, brotli.compress(body))
 
 
 @pytest_asyncio.fixture
@@ -172,7 +208,7 @@ async def endpoint_server(unused_tcp_port: int) -> AsyncIterator[str]:
 async def test_contexts_are_nested_and_task_local() -> None:
     assert art.current_trajectory() is None
     with art.Trajectory() as outer:
-        assert art.current_trajectory(required=True) is outer
+        assert art.current_trajectory(require=True) is outer
         with art.Trajectory() as inner:
             assert art.current_trajectory() is inner
         assert art.current_trajectory() is outer
@@ -187,7 +223,7 @@ async def test_contexts_are_nested_and_task_local() -> None:
         assert first is not second
     assert art.current_trajectory() is None
     with pytest.raises(RuntimeError, match="No trajectory"):
-        art.current_trajectory(required=True)
+        art.current_trajectory(require=True)
 
 
 async def test_group_context_and_async_helpers() -> None:
@@ -303,6 +339,233 @@ async def test_httpx_requests_and_aiohttp_capture_once(endpoint_server: str) -> 
     )
 
 
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br"])
+@pytest.mark.parametrize("mode", ["raw", "bytes", "lines"])
+def test_httpx_sync_stream_consumption_captures_decoded_body_once(
+    encoding: str, mode: str
+) -> None:
+    body = _streaming_chat_body()
+    compressed = _encoded(body, encoding)
+
+    def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": encoding},
+            stream=_SyncChunks(compressed),
+        )
+
+    with art.Trajectory() as trajectory:
+        with httpx.Client(transport=httpx.MockTransport(response)) as client:
+            with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                if mode == "raw":
+                    assert b"".join(result.iter_raw()) == compressed
+                elif mode == "bytes":
+                    assert b"".join(result.iter_bytes()) == body
+                else:
+                    list(result.iter_lines())
+
+    assert len(trajectory.exchanges.chat_completions) == 1
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br"])
+@pytest.mark.parametrize("mode", ["raw", "bytes", "lines"])
+async def test_httpx_async_stream_consumption_captures_decoded_body_once(
+    encoding: str, mode: str
+) -> None:
+    body = _streaming_chat_body()
+    compressed = _encoded(body, encoding)
+
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": encoding},
+            stream=_AsyncChunks(compressed),
+        )
+
+    with art.Trajectory() as trajectory:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            async with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                if mode == "raw":
+                    assert (
+                        b"".join([chunk async for chunk in result.aiter_raw()])
+                        == compressed
+                    )
+                elif mode == "bytes":
+                    assert (
+                        b"".join([chunk async for chunk in result.aiter_bytes()])
+                        == body
+                    )
+                else:
+                    _ = [line async for line in result.aiter_lines()]
+
+    assert len(trajectory.exchanges.chat_completions) == 1
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br"])
+async def test_httpx_terminal_event_captures_before_response_close(
+    encoding: str,
+) -> None:
+    body = _streaming_chat_body()
+    compressed = _encoded(body, encoding)
+
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-encoding": encoding,
+                "content-type": "text/event-stream",
+            },
+            stream=_AsyncChunks(compressed),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    request = client.build_request(
+        "POST",
+        "https://example.test/v1/chat/completions",
+        json={"model": "test/model", "messages": [], "stream": True},
+    )
+    with art.Trajectory() as trajectory:
+        result = await client.send(request, stream=True)
+        iterator = cast(AsyncGenerator[bytes, None], result.aiter_bytes())
+        received = bytearray()
+        async for chunk in iterator:
+            received.extend(chunk)
+            if b"data: [DONE]\n\n" in received:
+                break
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert not result.is_closed
+    await iterator.aclose()
+    await result.aclose()
+    await client.aclose()
+
+
+def test_httpx_raw_capture_failure_does_not_change_user_stream() -> None:
+    malformed = b"not a gzip stream"
+
+    def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=_SyncChunks(malformed),
+        )
+
+    with art.Trajectory() as trajectory:
+        with httpx.Client(transport=httpx.MockTransport(response)) as client:
+            with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                assert b"".join(result.iter_raw()) == malformed
+
+    assert not trajectory.exchanges
+
+
+async def test_httpx_async_raw_capture_failure_does_not_change_user_stream() -> None:
+    malformed = b"not a gzip stream"
+
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=_AsyncChunks(malformed),
+        )
+
+    with art.Trajectory() as trajectory:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            async with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                assert (
+                    b"".join([chunk async for chunk in result.aiter_raw()]) == malformed
+                )
+
+    assert not trajectory.exchanges
+
+
+def _streaming_chat_body() -> bytes:
+    return _sse(
+        [
+            (
+                None,
+                {
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "test/model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "hello"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            ),
+            (None, "[DONE]"),
+        ]
+    )
+
+
+def test_httpx_abandoned_compressed_raw_stream_is_excluded() -> None:
+    compressed = gzip.compress(_streaming_chat_body())
+
+    def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=_SyncChunks(compressed),
+        )
+
+    with art.Trajectory() as trajectory:
+        with httpx.Client(transport=httpx.MockTransport(response)) as client:
+            with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                iterator = cast(Generator[bytes, None, None], result.iter_raw())
+                next(iterator)
+                iterator.close()
+
+    assert not trajectory.exchanges
+
+
+async def test_httpx_abandoned_compressed_async_raw_stream_is_excluded() -> None:
+    compressed = gzip.compress(_streaming_chat_body())
+
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=_AsyncChunks(compressed),
+        )
+
+    with art.Trajectory() as trajectory:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            async with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                iterator = cast(AsyncGenerator[bytes, None], result.aiter_raw())
+                await anext(iterator)
+                await iterator.aclose()
+
+    assert not trajectory.exchanges
+
+
 async def test_aiohttp_capture_covers_stream_reader_consumption_methods(
     endpoint_server: str,
 ) -> None:
@@ -349,6 +612,28 @@ async def test_requests_session_stream_default_is_preserved(
     assert len(trajectory.exchanges.chat_completions) == 1
 
 
+async def test_requests_decode_unicode_preserves_string_chunks(
+    endpoint_server: str,
+) -> None:
+    body = {"model": "test/model", "messages": [{"role": "user", "content": "hi"}]}
+
+    def consume() -> list[str | bytes]:
+        with requests.post(
+            f"{endpoint_server}/chat/completions",
+            json=body,
+            stream=True,
+            timeout=5,
+        ) as response:
+            return list(response.iter_content(chunk_size=5, decode_unicode=True))
+
+    with art.Trajectory() as trajectory:
+        chunks = await asyncio.to_thread(consume)
+
+    assert chunks
+    assert all(isinstance(chunk, str) for chunk in chunks)
+    assert len(trajectory.exchanges.chat_completions) == 1
+
+
 async def test_native_openai_and_anthropic_sdks(endpoint_server: str) -> None:
     openai = AsyncOpenAI(base_url=endpoint_server, api_key="test")
     anthropic = AsyncAnthropic(
@@ -372,6 +657,136 @@ async def test_native_openai_and_anthropic_sdks(endpoint_server: str) -> None:
     assert len(trajectory.exchanges.completions) == 1
     assert len(trajectory.exchanges.responses) == 1
     assert len(trajectory.exchanges.messages) == 1
+
+
+async def test_native_openai_chat_stream_captures_at_done_event() -> None:
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_AsyncChunks(_streaming_chat_body()),
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    client = AsyncOpenAI(
+        base_url="https://example.test/v1",
+        api_key="test",
+        http_client=http_client,
+    )
+    with art.Trajectory() as trajectory:
+        stream = await client.chat.completions.create(
+            model="test/model",
+            messages=[],
+            stream=True,
+        )
+        chunks = [chunk async for chunk in stream]
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "hello"
+    await stream.close()
+    assert len(trajectory.exchanges.chat_completions) == 1
+    await client.close()
+
+
+def test_native_openai_preloaded_chat_stream_captures_once() -> None:
+    def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_streaming_chat_body(),
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(response))
+    client = OpenAI(
+        base_url="https://example.test/v1",
+        api_key="test",
+        http_client=http_client,
+    )
+    with art.Trajectory() as trajectory:
+        stream = client.chat.completions.create(
+            model="test/model",
+            messages=[],
+            stream=True,
+        )
+        assert len(trajectory.exchanges.chat_completions) == 1
+        chunks = list(stream)
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "hello"
+    stream.close()
+    assert len(trajectory.exchanges.chat_completions) == 1
+    client.close()
+
+
+async def test_native_async_openai_preloaded_chat_stream_captures_once() -> None:
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_streaming_chat_body(),
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    client = AsyncOpenAI(
+        base_url="https://example.test/v1",
+        api_key="test",
+        http_client=http_client,
+    )
+    with art.Trajectory() as trajectory:
+        stream = await client.chat.completions.create(
+            model="test/model",
+            messages=[],
+            stream=True,
+        )
+        assert len(trajectory.exchanges.chat_completions) == 1
+        chunks = [chunk async for chunk in stream]
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "hello"
+    await stream.close()
+    assert len(trajectory.exchanges.chat_completions) == 1
+    await client.close()
+
+
+def test_preloaded_malformed_stream_is_excluded() -> None:
+    def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse([(None, "corrupt"), (None, "[DONE]")]),
+        )
+
+    with art.Trajectory() as trajectory:
+        with httpx.Client(transport=httpx.MockTransport(response)) as client:
+            with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                assert list(result.iter_bytes())
+
+    assert not trajectory.exchanges
+
+
+def test_stream_terminal_without_sse_boundary_is_excluded() -> None:
+    body = _streaming_chat_body()[:-1]
+    with art.Trajectory() as trajectory:
+        state, token = begin(
+            "POST",
+            "https://example.test/v1/chat/completions",
+            {"model": "test/model", "messages": [], "stream": True},
+        )
+        reset(token)
+        assert state is not None
+        state.status_code = 200
+        state.add(body)
+        assert not state.captured
+        state.finish()
+
+    assert not trajectory.exchanges
 
 
 async def test_failed_and_incomplete_calls_are_excluded(endpoint_server: str) -> None:
@@ -634,6 +1049,7 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
     }
     response_event = {"type": "response.completed", "response": RESPONSE}
     message_events = [
+        ("ping", {"type": "ping"}),
         (
             "message_start",
             {
@@ -643,6 +1059,7 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
                     "content": [],
                     "stop_reason": None,
                     "usage": {"input_tokens": 1, "output_tokens": 0},
+                    "prompt_token_ids": [1],
                 },
             },
         ),
@@ -660,6 +1077,8 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
                 "type": "content_block_delta",
                 "index": 0,
                 "delta": {"type": "text_delta", "text": "hello"},
+                "token_ids": [2],
+                "logprobs": [-0.2],
             },
         ),
         ("content_block_stop", {"type": "content_block_stop", "index": 0}),
@@ -669,6 +1088,7 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
                 "type": "message_delta",
                 "delta": {"stop_reason": "end_turn", "stop_sequence": None},
                 "usage": {"output_tokens": 1},
+                "prompt_token_ids": [1],
                 "token_ids": [2],
                 "logprobs": [-0.2],
             },
@@ -710,8 +1130,143 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
             content = exchange.response.content[0]
             assert isinstance(content, TextBlock)
             assert content.text == "hello"
+            assert content.model_extra is not None
+            assert content.model_extra["token_ids"] == [2]
+            assert content.model_extra["logprobs"] == [-0.2]
             assert getattr(exchange.response, "token_ids") == [2]
             assert getattr(exchange.response, "logprobs") == [-0.2]
+            assert getattr(exchange.response, "prompt_token_ids") == [1]
+
+        with art.Trajectory() as trajectory:
+            state, token = begin(
+                "POST",
+                f"https://example.test/v1/{endpoint.replace('_', '/')}",
+                request,
+            )
+            reset(token)
+            assert state is not None
+            state.status_code = 200
+            for byte in body[:-1]:
+                state.add(bytes([byte]))
+            assert not state.captured
+            state.add(body[-1:])
+            assert state.captured
+
+        assert (
+            sum(
+                len(exchanges)
+                for exchanges in (
+                    trajectory.exchanges.chat_completions,
+                    trajectory.exchanges.completions,
+                    trajectory.exchanges.responses,
+                    trajectory.exchanges.messages,
+                )
+            )
+            == 1
+        )
+
+
+def test_streaming_messages_error_event_is_rejected_and_not_captured() -> None:
+    body = _sse(
+        [
+            (
+                "error",
+                {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": "failed"},
+                },
+            )
+        ]
+    )
+    request = {"model": "test/model", "messages": [], "stream": True}
+    with pytest.raises(ValueError, match="returned an error event"):
+        build_exchange(
+            "messages",
+            request,
+            body,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
+    with art.Trajectory() as trajectory:
+        state, token = begin("POST", "https://example.test/v1/messages", request)
+        reset(token)
+        assert state is not None
+        state.status_code = 200
+        state.add(body)
+        state.finish()
+
+    assert not trajectory.exchanges
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prompt_token_ids", [True]),
+        ("prompt_token_ids", [-1]),
+        ("token_ids", [False]),
+        ("token_ids", [-1]),
+        ("logprobs", [True]),
+        ("logprobs", [float("nan")]),
+        ("logprobs", [float("inf")]),
+    ],
+)
+def test_streaming_messages_reject_malformed_token_metadata(
+    field: str, value: list[object]
+) -> None:
+    delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": 1},
+        "prompt_token_ids": [1],
+        "token_ids": [2],
+        "logprobs": [-0.2],
+        field: value,
+    }
+    body = _sse(
+        [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        **MESSAGE,
+                        "content": [],
+                        "stop_reason": None,
+                        "usage": {"input_tokens": 1, "output_tokens": 0},
+                    },
+                },
+            ),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": "", "citations": None},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "hello"},
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            ("message_delta", delta),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must contain"):
+        build_exchange(
+            "messages",
+            {"model": "test/model", "messages": [], "stream": True},
+            body,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
 
 
 def test_streaming_chat_choices_are_accumulated_by_index() -> None:
@@ -755,6 +1310,45 @@ def test_streaming_chat_choices_are_accumulated_by_index() -> None:
         "ac",
         "bd",
     ]
+
+
+def test_streaming_chat_preserves_reasoning_fields() -> None:
+    now = datetime.now()
+
+    def chunk(**delta: str) -> dict[str, Any]:
+        return {
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test/model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", **delta},
+                    "finish_reason": None,
+                    "logprobs": None,
+                }
+            ],
+        }
+
+    exchange = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": [], "stream": True},
+        _sse(
+            [
+                (None, chunk(reasoning="r1", reasoning_content="c1")),
+                (None, chunk(reasoning="r2", reasoning_content="c2")),
+                (None, "[DONE]"),
+            ]
+        ),
+        start_time=now,
+        end_time=now + timedelta(seconds=1),
+    )
+
+    assert isinstance(exchange, ChatCompletionsExchange)
+    message = exchange.response.choices[0].message
+    assert getattr(message, "reasoning") == "r1r2"
+    assert getattr(message, "reasoning_content") == "c1c2"
 
 
 def test_streaming_chat_ignores_keepalives_and_azure_prologue() -> None:

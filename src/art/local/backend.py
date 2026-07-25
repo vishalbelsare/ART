@@ -91,6 +91,7 @@ from ..preprocessing.tokenize import (
 )
 from ..serving_capabilities import ServingCapabilities
 from ..trajectories import Trajectory, TrajectoryGroup
+from ..trajectories._selection import automatic_training_model_selector
 from ..types import (
     Choice,
     LocalTrainResult,
@@ -949,6 +950,12 @@ class LocalBackend:
         chat_template_tool_schema_format = self._chat_template_tool_schema_format(
             internal_config
         )
+        model_max_sequence_length = self._model_max_sequence_length(model)
+        training_max_sequence_length = (
+            min(model_max_sequence_length, packed_sequence_length)
+            if packed_sequence_length is not None
+            else model_max_sequence_length
+        )
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -958,11 +965,14 @@ class LocalBackend:
                 image_processor=self._image_processors[model.base_model],
                 chat_template_kwargs=chat_template_kwargs,
                 chat_template_tool_schema_format=chat_template_tool_schema_format,
+                model=automatic_training_model_selector(
+                    self._model_inference_name(model)
+                ),
+                _max_sequence_length=training_max_sequence_length,
             )
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = self._model_max_sequence_length(model)
         too_long_for_model = [
             result
             for result in tokenized_results
