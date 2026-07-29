@@ -129,7 +129,7 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
     )
 
     assert _variant_packed_sequence_length(variant) == 1024
-    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 1024}
+    assert _variant_train_kwargs(variant) == {}
     config = _build_internal_config(
         variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
     )
@@ -217,7 +217,7 @@ def test_yes_no_trainability_passes_initially_saturated_stable_report() -> None:
                 step=1,
                 eval_reward=0.9375,
                 train_reward=0.875,
-                train_metrics={"grad_norm": 54.0},
+                train_metrics={"loss/grad_norm": 54.0},
             )
         ],
     )

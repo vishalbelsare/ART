@@ -50,7 +50,7 @@ _VARIANT_NAME = Literal[
 _RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
 
 
-class _TrainKwargs(TypedDict):
+class _TrainKwargs(TypedDict, total=False):
     packed_sequence_length: int
 
 
@@ -550,6 +550,8 @@ def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
 
 
 def _variant_train_kwargs(variant: _TrainabilityVariant) -> _TrainKwargs:
+    if variant.backend_name == "megatron":
+        return {}
     return {"packed_sequence_length": _variant_packed_sequence_length(variant)}
 
 
@@ -1035,7 +1037,7 @@ async def run_yes_no_trainability_async(
                     1e-4,
                 ),
                 loss_fn="cispo",
-                packed_sequence_length=train_kwargs["packed_sequence_length"],
+                **train_kwargs,
             )
             await model.log(
                 train_groups,
@@ -1119,7 +1121,9 @@ def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
         and report.final_eval_reward is not None
         and report.final_eval_reward >= report.reward_threshold
         and bool(report.steps)
-        and any(step.train_metrics.get("grad_norm", 0.0) > 0.0 for step in report.steps)
+        and any(
+            step.train_metrics.get("loss/grad_norm", 0.0) > 0.0 for step in report.steps
+        )
     )
     return learned_from_below_threshold or already_saturated_and_stable
 

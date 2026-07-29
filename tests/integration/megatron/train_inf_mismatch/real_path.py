@@ -401,29 +401,28 @@ async def _rollout(
     import art
 
     messages = [{"role": "user", "content": prompt}]
-
-    async def _request() -> None:
-        request_kwargs: dict[str, Any] = {}
-        if extra_body is not None:
-            request_kwargs["extra_body"] = extra_body
-        response = await model.openai_client().chat.completions.create(
-            model=model.get_inference_name(),
-            messages=messages,
-            max_tokens=max_completion_tokens,
-            temperature=0.8,
-            logprobs=True,
-            top_logprobs=TOP_K,
-            **request_kwargs,
-        )
-        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
-            logprobs = response.choices[0].logprobs
-            trajectory.reward = reward
-            trajectory.metrics["completion_tokens"] = (
+    request_kwargs: dict[str, Any] = {}
+    if extra_body is not None:
+        request_kwargs["extra_body"] = extra_body
+    response = await model.openai_client().chat.completions.create(
+        model=model.get_inference_name(),
+        messages=messages,
+        max_tokens=max_completion_tokens,
+        temperature=0.8,
+        logprobs=True,
+        top_logprobs=TOP_K,
+        **request_kwargs,
+    )
+    choice = response.choices[0]
+    logprobs = choice.logprobs
+    return art.Trajectory(
+        messages_and_choices=[*messages, choice],
+        reward=reward,
+        metrics={
+            "completion_tokens": (
                 len(logprobs.content or []) if logprobs is not None else 0
             )
-
-    return await art.capture_auto_trajectory(  # ty: ignore[deprecated]
-        _request()
+        },
     )
 
 
