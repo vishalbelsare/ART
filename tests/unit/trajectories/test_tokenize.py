@@ -9,7 +9,7 @@ from statistics import median
 import sys
 from time import perf_counter
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from anthropic.types import ImageBlockParam, Message, MessageParam
 from openai.types import Completion
@@ -1087,6 +1087,54 @@ class _FakeTokenizer:
     ) -> list[int]:
         self.calls.append(kwargs)
         return [10, 11] if messages[-1]["role"] == "assistant" else [10]
+
+
+def test_fallback_upgrades_legacy_qwen_template_when_preservation_is_requested() -> (
+    None
+):
+    template = (
+        "{% if enable_thinking %}think{% endif %}"
+        "{%- if loop.index0 > ns.last_query_index %}reasoning{% endif %}"
+    )
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[{"role": "assistant", "content": "answer"}],
+        message_sources=[None],
+        chat_template=template,
+        chat_template_kwargs={"preserve_thinking": True},
+    )
+    tokenizer = _FakeTokenizer()
+
+    history.tokenize(tokenizer=tokenizer)
+
+    configured = tokenizer.calls[0]["chat_template"]
+    assert isinstance(configured, str)
+    assert "preserve_thinking is defined and preserve_thinking is true" in configured
+
+
+def test_tokenizer_dict_chat_template_fallback_is_not_forwarded() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[{"role": "assistant", "content": "answer"}],
+        message_sources=[None],
+    )
+
+    class Tokenizer:
+        chat_template = {"default": "{{ message.content }}"}
+
+        def __call__(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+            del text, add_special_tokens
+            return [11]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            assert "chat_template" not in kwargs
+            return [10, 11] if messages[-1]["role"] == "assistant" else [10]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.tokens == [10, 11]
 
 
 def test_fallback_uses_template_overrides_and_nan_logprobs(
@@ -2963,6 +3011,205 @@ def test_responses_terminal_generation_without_output_items_survives_rerender() 
     ]
 
 
+@pytest.mark.parametrize(
+    "arguments", ('{"id": 3}', {"id": 3}), ids=("json-string", "mapping")
+)
+def test_chat_rerender_normalizes_tool_arguments(arguments: object) -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": arguments},
+                    }
+                ],
+            },
+        ],
+        message_sources=[None, None],
+    )
+    rendered_arguments: list[object] = []
+
+    class Tokenizer:
+        chat_template = (
+            "{% set _args = tc.arguments %}"
+            "{% for k, v in _args.items() %}{{ k }}{{ v }}{% endfor %}"
+        )
+
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del text, kwargs
+            return [3]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            for message in messages:
+                for call in message.get("tool_calls", []):
+                    arguments = call["function"]["arguments"]
+                    assert isinstance(arguments, dict)
+                    rendered_arguments.append(arguments)
+            return [1, 2, 3] if messages[-1]["role"] == "assistant" else [1, 2]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.tokens == [1, 2, 3]
+    assert rendered_arguments == [{"id": 3}]
+
+
+@pytest.mark.parametrize("reasoning", (None, "think"), ids=("tool-only", "reasoning"))
+@pytest.mark.parametrize(
+    ("canonical_prompt", "exact_prompt"),
+    (([1, 10], [1]), ([1, 10], [900, 10]), ([], [900])),
+    ids=("shorter-prompt", "changed-prompt", "inserted-prompt"),
+)
+def test_structured_tool_arguments_remain_in_sampled_region_without_exact_tokens(
+    reasoning: str | None,
+    canonical_prompt: list[int],
+    exact_prompt: list[int],
+) -> None:
+    exchange = _chat_exchange(exact_prompt, [2])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("token_ids")
+    choice["logprobs"] = None
+    choice["message"] = {
+        "role": "assistant",
+        "reasoning": reasoning,
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": '{"x":1}'},
+            }
+        ],
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    class Tokenizer:
+        chat_template = "{% set args = tc.arguments %}{{ args.items() }}"
+
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {
+                "turn 0": [1],
+                "think": [15, 16],
+                "lookup": [20],
+                '{"x":1}': [30, 31],
+            }[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] != "assistant":
+                return canonical_prompt
+            function = messages[-1]["tool_calls"][0]["function"]
+            assert isinstance(function["arguments"], dict)
+            if (
+                function["name"] != "lookup"
+                or messages[-1].get("reasoning") != reasoning
+            ):
+                return [*canonical_prompt, 95, 96, 98, 25, 99, 26]
+            return [
+                *canonical_prompt,
+                *([15, 16] if reasoning else []),
+                20,
+                25,
+                30,
+                31,
+                26,
+            ]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    sampled_tokens = [*([15, 16] if reasoning else []), 20, 25, 30, 31]
+    assert tokenized.tokens == [*exact_prompt, *sampled_tokens, 26]
+    assert tokenized.flags[: len(exact_prompt)] == [tr.TokenFlag.EXACT] * len(
+        exact_prompt
+    )
+    sampled = slice(len(exact_prompt), -1)
+    assert tokenized.flags[sampled] == [tr.TokenFlag.SAMPLED] * len(sampled_tokens)
+    assert all(math.isnan(value) for value in tokenized.logprobs[sampled])
+
+
+def test_reasoning_probe_failure_does_not_override_authoritative_render() -> None:
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("prompt_token_ids")
+    choice.pop("token_ids")
+    choice["logprobs"] = None
+    choice["message"] = {
+        "role": "assistant",
+        "reasoning": "think",
+        "content": "answer",
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"turn 0": [1], "think": [20], "answer": [30]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] != "assistant":
+                return [1]
+            if not messages[-1].get("reasoning"):
+                raise ValueError("speculative render rejected")
+            return [1, 20, 30]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.tokens == [1, 20, 30]
+    assert tokenized.flags[1:] == [tr.TokenFlag.SAMPLED] * 2
+
+
+@pytest.mark.parametrize("arguments", ("not-json", "[]"))
+def test_chat_rerender_rejects_invalid_tool_arguments(arguments: str) -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "lookup", "arguments": arguments}}
+                ],
+            }
+        ],
+        message_sources=[None],
+    )
+
+    class Tokenizer:
+        chat_template = "{{ tool_call.arguments|items }}"
+
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del text, kwargs
+            return []
+
+        def apply_chat_template(self, *args: object, **kwargs: object) -> list[int]:
+            raise AssertionError("invalid arguments must fail before rendering")
+
+    with pytest.raises(ValueError, match="tool-call arguments"):
+        history.tokenize(tokenizer=Tokenizer())
+
+
 def test_responses_empty_chat_source_requires_outputless_generation() -> None:
     from art.trajectories._tokenize import _responses_source_generation
 
@@ -3152,6 +3399,162 @@ def test_chat_prefix_retokenization_splits_unless_reconciled(
     )
     assert direct.tokens == tokenized.tokens
     assert grouped.trajectories[0].tokens == tokenized.tokens
+
+
+@pytest.mark.parametrize("length_changing_prompt", (False, True))
+def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokenization(
+    monkeypatch: pytest.MonkeyPatch, length_changing_prompt: bool
+) -> None:
+    class Tokenizer:
+        chat_template = "{{ preserve_thinking }}"
+
+        @staticmethod
+        def _render(
+            messages: list[dict[str, Any]], *, add_generation_prompt: bool
+        ) -> str:
+            rendered = ""
+            for message in messages:
+                rendered += f"<{message['role']}>"
+                if reasoning := message.get("reasoning") or message.get(
+                    "reasoning_content"
+                ):
+                    rendered += f"<think>{reasoning}</think>"
+                rendered += str(message.get("content") or "") + "<end>"
+            return rendered + ("<assistant>" if add_generation_prompt else "")
+
+        def __call__(self, text: str, **kwargs: object) -> object:
+            token_ids = [ord(character) for character in text]
+            if kwargs.get("return_offsets_mapping"):
+                return {
+                    "input_ids": token_ids,
+                    "offset_mapping": [
+                        (index, index + 1) for index in range(len(text))
+                    ],
+                }
+            return token_ids
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            tokenize: bool,
+            **kwargs: object,
+        ) -> object:
+            del kwargs
+            rendered = self._render(
+                messages, add_generation_prompt=add_generation_prompt
+            )
+            return self(rendered) if tokenize else rendered
+
+    tokenizer = Tokenizer()
+    first = _chat_exchange([], [])
+    first_messages = [{"role": "user", "content": "one"}]
+    first.request["messages"] = cast(list[ChatCompletionMessageParam], first_messages)
+    canonical_first_prompt = cast(
+        list[int],
+        tokenizer.apply_chat_template(
+            first_messages, add_generation_prompt=True, tokenize=True
+        ),
+    )
+    first_prompt = list(canonical_first_prompt)
+    first_prompt[0] = 900
+    if length_changing_prompt:
+        first_prompt.insert(1, 902)
+    first_message = {
+        "role": "assistant",
+        "reasoning": "thought-one",
+        "content": "first",
+    }
+    first_completed = cast(
+        list[int],
+        tokenizer.apply_chat_template(
+            [*first_messages, first_message],
+            add_generation_prompt=False,
+            tokenize=True,
+        ),
+    )
+    first_output = first_completed[len(canonical_first_prompt) :]
+    first_output[5] = 901
+    first_data = first.response.model_dump(mode="python")
+    first_data["choices"][0]["message"] = first_message
+    first_data["choices"][0]["prompt_token_ids"] = first_prompt
+    first_data["choices"][0]["token_ids"] = first_output
+    first_data["choices"][0]["logprobs"]["content"] = [
+        {
+            "token": f"token_id:{token_id}",
+            "logprob": -0.1,
+            "bytes": [],
+            "top_logprobs": [],
+        }
+        for token_id in first_output
+    ]
+    first.response = ChatCompletion.model_validate(first_data)
+
+    second = _chat_exchange([], [], offset=1)
+    second_messages = [
+        *first_messages,
+        first_message,
+        {"role": "user", "content": "two"},
+    ]
+    second.request["messages"] = cast(list[ChatCompletionMessageParam], second_messages)
+    canonical_second_prompt = cast(
+        list[int],
+        tokenizer.apply_chat_template(
+            second_messages, add_generation_prompt=True, tokenize=True
+        ),
+    )
+    second_prompt = list(canonical_second_prompt)
+    second_prompt[0] = 900
+    if length_changing_prompt:
+        second_prompt.insert(1, 902)
+    second_message = {
+        "role": "assistant",
+        "reasoning": "thought-two",
+        "content": "second",
+    }
+    second_completed = cast(
+        list[int],
+        tokenizer.apply_chat_template(
+            [*second_messages, second_message],
+            add_generation_prompt=False,
+            tokenize=True,
+        ),
+    )
+    second_output = second_completed[len(canonical_second_prompt) :]
+    second_data = second.response.model_dump(mode="python")
+    second_data["choices"][0]["message"] = second_message
+    second_data["choices"][0]["prompt_token_ids"] = second_prompt
+    second_data["choices"][0]["token_ids"] = second_output
+    second_data["choices"][0]["logprobs"]["content"] = [
+        {
+            "token": f"token_id:{token_id}",
+            "logprob": -0.2,
+            "bytes": [],
+            "top_logprobs": [],
+        }
+        for token_id in second_output
+    ]
+    second.response = ChatCompletion.model_validate(second_data)
+
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    )
+    assert len(trajectory.chat_completions_histories()) == 2
+    history = trajectory.chat_completions_history(
+        reconcile_text_equivalent_tokenizations=True
+    )
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+    with pytest.warns(UserWarning, match="preserved the original sampled token IDs"):
+        tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens[0] == 900
+    assert 901 in tokenized.tokens
+    assert sum(bool(flag & tr.TokenFlag.SAMPLED) for flag in tokenized.flags) == len(
+        first_output
+    ) + len(second_output)
 
 
 def test_template_change_rerenders_scaffold_but_preserves_sampled_output() -> None:
@@ -4547,6 +4950,23 @@ def test_empty_sampled_messages_need_no_content_boundary() -> None:
     ]
 
 
+def test_reasoning_only_choice_treats_empty_token_ids_as_missing() -> None:
+    from art.trajectories import _tokenize
+
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice["logprobs"] = None
+    choice["message"] = {
+        "role": "assistant",
+        "reasoning": "unfinished thought",
+        "content": None,
+    }
+    parsed = ChatCompletion.model_validate(data).choices[0]
+
+    assert _tokenize._chat_choice_output_tokens(parsed)[0] is None
+
+
 def test_empty_sampled_message_inserts_exact_control_token() -> None:
     exchange = _chat_exchange([], [2])
     exchange.response.choices[0].message.content = ""
@@ -4702,6 +5122,23 @@ def test_renderer_reasoning_content_alias_preserves_reasoning() -> None:
         tr.TokenFlag.SAMPLED,
         tr.TokenFlag.SAMPLED,
     ]
+
+
+def test_nonstring_reasoning_uses_reasoning_content_slot() -> None:
+    from art.trajectories import _tokenize
+
+    message = {
+        "role": "assistant",
+        "reasoning": [{"type": "thinking", "thinking": "structured"}],
+        "reasoning_content": "think",
+        "content": "answer",
+    }
+
+    assert _tokenize._chat_message_parts(message) == [
+        ("reasoning", "think"),
+        ("content", "answer"),
+    ]
+    assert len(_tokenize._chat_message_text_slot_groups(message)) == 2
 
 
 def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None:
