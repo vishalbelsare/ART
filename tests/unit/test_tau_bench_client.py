@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
 import importlib
 import json
 from types import SimpleNamespace
@@ -27,10 +29,11 @@ def test_client_reuses_connections_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, Any] = {}
+    transport_kwargs: list[dict[str, Any]] = []
 
     class FakeTransport:
         def __init__(self, **kwargs: Any) -> None:
-            seen["transport_kwargs"] = kwargs
+            transport_kwargs.append(kwargs)
 
     class FakeAsyncClient:
         def __init__(self, **kwargs: Any) -> None:
@@ -40,12 +43,111 @@ def test_client_reuses_connections_by_default(
     monkeypatch.setattr(client_module.httpx, "AsyncHTTPTransport", FakeTransport)
     TauBenchClient(base_url="http://tau.test", api_key="secret")
 
-    limits = seen["transport_kwargs"]["limits"]
-    assert isinstance(limits, httpx.Limits)
-    assert limits.max_connections == 100_000
-    assert limits.max_keepalive_connections == 100_000
-    assert seen["transport_kwargs"]["retries"] == 2
+    assert len(transport_kwargs) == 64
+    limits = [kwargs["limits"] for kwargs in transport_kwargs]
+    assert all(isinstance(limit, httpx.Limits) for limit in limits)
+    assert {limit.max_connections for limit in limits} == {100_000}
+    assert sum(limit.max_keepalive_connections or 0 for limit in limits) == 100_000
+    assert {kwargs["retries"] for kwargs in transport_kwargs} == {2}
     assert isinstance(seen["timeout"], httpx.Timeout)
+
+
+@pytest.mark.asyncio
+async def test_sharded_transport_routes_round_robin_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transports: list[Any] = []
+
+    class FakeTransport:
+        def __init__(self, **kwargs: Any) -> None:
+            self.index = len(transports)
+            self.closed = False
+            transports.append(self)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, request=request, extensions={"shard": self.index}
+            )
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(client_module.httpx, "AsyncHTTPTransport", FakeTransport)
+    transport = client_module._ShardedAsyncHTTPTransport(
+        limits=httpx.Limits(
+            max_connections=100_000,
+            max_keepalive_connections=100_000,
+        ),
+        retries=2,
+    )
+    request = httpx.Request("GET", "http://tau.test")
+
+    shards = [
+        (await transport.handle_async_request(request)).extensions["shard"]
+        for _ in range(65)
+    ]
+    await transport.aclose()
+
+    assert shards == [*range(64), 0]
+    assert all(item.closed for item in transports)
+
+
+@pytest.mark.asyncio
+async def test_sharded_transport_does_not_strand_aggregate_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTransport:
+        def __init__(self, **kwargs: Any) -> None:
+            self.capacity = asyncio.Semaphore(kwargs["limits"].max_connections)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await self.capacity.acquire()
+
+            async def release() -> None:
+                self.capacity.release()
+
+            return httpx.Response(
+                200,
+                request=request,
+                stream=ClosingStream(release),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    class ClosingStream(httpx.AsyncByteStream):
+        def __init__(self, close: Any) -> None:
+            self.close = close
+
+        async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+            if False:
+                yield b""
+
+        async def aclose(self) -> None:
+            await self.close()
+
+    monkeypatch.setattr(client_module.httpx, "AsyncHTTPTransport", FakeTransport)
+    transport = client_module._ShardedAsyncHTTPTransport(
+        limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+        retries=0,
+        shards=2,
+    )
+    request = httpx.Request(
+        "GET",
+        "http://tau.test",
+        extensions={"timeout": {"pool": 0.1}},
+    )
+
+    slow = await transport.handle_async_request(request)
+    completed = await transport.handle_async_request(request)
+    with pytest.raises(httpx.PoolTimeout):
+        await transport.handle_async_request(request)
+    await completed.aclose()
+    replacement = await transport.handle_async_request(request)
+
+    await replacement.aclose()
+    await slow.aclose()
+    await transport.aclose()
 
 
 @pytest.mark.asyncio
@@ -322,6 +424,7 @@ async def test_rollout_supports_string_model_args(
     assert trajectory.metrics["tokens/completion"] == 5
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
+    assert client.create_kwargs["idle_timeout_seconds"] == 30 * 60
     policy_client: Any = rollout_module.openai_clients[
         ("http://model.test/v1", "model-key")
     ]
@@ -334,9 +437,14 @@ async def test_rollout_supports_string_model_args(
         write=30,
         pool=30,
     )
-    assert http_client.transport.retries == 2
-    assert http_client.transport.limits.max_connections == 100_000
-    assert http_client.transport.limits.max_keepalive_connections == 100_000
+    transports = http_client.transport.transports
+    assert len(transports) == 64
+    assert {transport.retries for transport in transports} == {2}
+    assert {transport.limits.max_connections for transport in transports} == {100_000}
+    assert (
+        sum(transport.limits.max_keepalive_connections for transport in transports)
+        == 100_000
+    )
 
 
 @pytest.mark.asyncio
@@ -361,6 +469,39 @@ async def test_rollout_supports_art_model_like_args() -> None:
 
     assert trajectory.metadata["scenario_id"] == "task_001"
     assert trajectory.metrics["num_turns"] == 1
+    assert client.create_kwargs["idle_timeout_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_rollout_preserves_server_lease_for_explicit_policy_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rollout_module = importlib.import_module("art.tau_bench.rollout")
+    rollout_module.openai_clients.clear()
+    monkeypatch.setattr(rollout_module, "AsyncOpenAI", FakeAsyncOpenAI)
+    monkeypatch.setattr(
+        rollout_module,
+        "DefaultAsyncHttpxClient",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        rollout_module.httpx,
+        "AsyncHTTPTransport",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    client = FakeTauBenchClient()
+
+    await rollout_module.rollout(
+        Scenario(domain="banking_knowledge", task=Task(id="task_001")),
+        "http://model.test/v1",
+        "model-key",
+        "default",
+        client=client,
+        max_turns=1,
+        chat_completion_kwargs={"timeout": None},
+    )
+
+    assert client.create_kwargs["idle_timeout_seconds"] is None
 
 
 @pytest.mark.asyncio

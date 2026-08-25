@@ -15,7 +15,7 @@ from art.costs import get_model_pricing, tokens_to_cost
 from art.model import Model
 from art.trajectories import Trajectory
 
-from .client import Scenario, TauBenchClient, _get_default_client
+from .client import Scenario, TauBenchClient, _get_default_client, _sharded_transport
 
 openai_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 CONTEXT_TOKEN_LIMIT = 32_768
@@ -24,6 +24,7 @@ _POLICY_CONNECTION_LIMIT = 100_000
 _POLICY_CONNECT_RETRIES = 2
 _POLICY_MAX_RETRIES = 1
 _POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=10, read=10 * 60, write=30, pool=30)
+_STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS = 30 * 60
 
 
 @overload
@@ -94,6 +95,15 @@ async def rollout(
         ),
         retrieval_config=retrieval_config,
         retrieval_config_kwargs=retrieval_config_kwargs,
+        idle_timeout_seconds=(
+            _STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS
+            if isinstance(base_url_or_model, str)
+            and (
+                chat_completion_kwargs is None
+                or "timeout" not in chat_completion_kwargs
+            )
+            else None
+        ),
     ) as env:
         environment_startup = time.perf_counter() - started
         chat_completion_kwargs = chat_completion_kwargs or {}
@@ -249,7 +259,7 @@ def _completion_client_and_model(
             max_retries=_POLICY_MAX_RETRIES,
             http_client=DefaultAsyncHttpxClient(
                 timeout=_POLICY_HTTP_TIMEOUT,
-                transport=httpx.AsyncHTTPTransport(
+                transport=_sharded_transport(
                     retries=_POLICY_CONNECT_RETRIES,
                     limits=httpx.Limits(
                         max_connections=_POLICY_CONNECTION_LIMIT,
