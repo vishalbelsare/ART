@@ -30,6 +30,7 @@ from ..trajectories import (
 from ..trajectories._selection import ModelSelector, resolve_training_model
 from ..types import MessagesAndChoices
 from ..utils.chat_template import (
+    TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR,
     default_chat_template_kwargs_for_tokenizer,
     merge_chat_template_kwargs,
     normalize_tool_call_arguments_for_chat_template,
@@ -240,13 +241,20 @@ def _slice_moe_routes(
         if start <= 0:
             return routes
         if start >= routes.shape[0]:
-            return np.empty((0, routes.shape[1], routes.shape[2]), dtype=np.int32)
+            return MoeRouteArray(
+                np.empty(
+                    (0, routes.shape[1], routes.shape[2]),
+                    dtype=routes.segments[0].dtype,
+                ),
+                num_experts=routes.num_experts,
+                validate=False,
+            )
         return MoeRouteSegments(
             segments=tuple(
                 segment for _, segment in routes.iter_slices(start, routes.shape[0])
             )
         )
-    return routes[start:]
+    return cast(MoeRouteArray, routes[start:])
 
 
 class _TokenDecoder(Protocol):
@@ -324,7 +332,11 @@ def _normalize_tool_call_arguments_for_chat_template(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     return normalize_tool_call_arguments_for_chat_template(
-        messages, tokenizer.chat_template
+        messages,
+        tokenizer.chat_template,
+        require_mapping=bool(
+            getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, False)
+        ),
     )
 
 
@@ -725,7 +737,7 @@ def tokenize_trajectory_groups(
     model: ModelSelector | str | None = None,
     _max_sequence_length: int | None = None,
 ) -> Generator["TokenizedResult", None, None]:
-    for group in trajectory_groups:
+    for prompt_id, group in enumerate(trajectory_groups):
         if not group:
             continue
         results: list[TokenizedResult] = []
@@ -903,8 +915,6 @@ def tokenize_trajectory_groups(
             for result in trajectory_results:
                 result.weight = weight
             results.extend(trajectory_results)
-        # Choose a random prompt id
-        prompt_id = random.randint(-(2**63), 2**63 - 1)
         # Find the longest shared prefix
         # TODO: Potentially support multiple prompts per group
         # Initial thought is to sort the results by token_ids and then
@@ -933,7 +943,7 @@ def tokenize_trajectory_groups(
             result.prompt_id = prompt_id
             result.prompt_length = prompt_length
         if shuffle_group_trajectories:
-            random.shuffle(results)
+            random.Random(prompt_id).shuffle(results)
         yield from results
 
 

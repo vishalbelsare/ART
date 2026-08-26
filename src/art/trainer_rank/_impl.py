@@ -784,6 +784,13 @@ class TrainerRank:
         memory_safety_factor: float = 1.10,
         memory_reserve_fraction: float = 0.03,
     ) -> None:
+        pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
+        if pp_size > 1 or len(runtime.model) > 1:
+            raise NotImplementedError(
+                "TrainerRank does not use the MCore forward/backward schedule and "
+                "therefore requires PP=1 with exactly one local model chunk; "
+                f"got pp={pp_size}, chunks={len(runtime.model)}"
+            )
         if head_chunk_tokens < 1:
             raise ValueError("head_chunk_tokens must be >= 1")
         if shared_prefix_max_depth < 0:
@@ -3572,7 +3579,9 @@ class TrainerRank:
                     parent_ids=batch.parent_ids,
                     topology=topology,
                     config=_context_parallel_config_for_provider(
-                        self.runtime.provider, self.device
+                        self.runtime.provider,
+                        self.device,
+                        handler,
                     ),
                     original_seq_len=sequence_length,
                     build_gdn_execution_spec=handler.build_gdn_execution_spec,
@@ -3623,7 +3632,11 @@ class TrainerRank:
         prepared = prepare_cp_micro(
             micro=sparse_micro,
             topology=topology,
-            config=_context_parallel_config_for_provider(provider, self.device),
+            config=_context_parallel_config_for_provider(
+                provider,
+                self.device,
+                handler,
+            ),
             cp_group=ps.get_context_parallel_group(check_initialized=False),
             cp_rank=ps.get_context_parallel_rank(),
             build_gdn_execution_spec=handler.build_gdn_execution_spec,

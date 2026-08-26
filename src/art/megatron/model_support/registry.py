@@ -16,6 +16,7 @@ _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
 _GEMMA4_DENSE_HANDLER_KEY = "gemma4_dense"
 _GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _DSV4_HANDLER_KEY = "dsv4"
+_GLM52_HANDLER_KEY = "glm52"
 _GPT_OSS_MOE_HANDLER_KEY = "gpt_oss_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
 _WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
@@ -69,6 +70,16 @@ _DSV4_TARGET_MODULES = (
     "o_b_proj",
     "compressor.kv_proj",
     "compressor.gate_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "experts",
+)
+_GLM52_TARGET_MODULES = (
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "o_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
@@ -220,6 +231,19 @@ DSV4_SPEC = ModelSupportSpec(
     dependency_floor=DependencyFloor(transformers="5.12.1"),
 )
 
+GLM52_SPEC = ModelSupportSpec(
+    key="glm52",
+    handler_key=_GLM52_HANDLER_KEY,
+    is_moe=True,
+    model_names=("zai-org/GLM-5.2",),
+    default_target_modules=_GLM52_TARGET_MODULES,
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
+    dependency_floor=DependencyFloor(
+        transformers="5.12.1",
+        megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",
+    ),
+)
+
 GPT_OSS_MOE_SPEC = ModelSupportSpec(
     key="gpt_oss_moe",
     handler_key=_GPT_OSS_MOE_HANDLER_KEY,
@@ -245,9 +269,10 @@ VALIDATED_MODEL_SUPPORT_SPECS = (
     GEMMA4_MOE_SPEC,
     GEMMA4_DENSE_SPEC,
     DSV4_SPEC,
+    GLM52_SPEC,
     GPT_OSS_MOE_SPEC,
 )
-PROBE_ONLY_MODEL_SUPPORT_SPECS = ()
+PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = ()
 _ALL_MODEL_SUPPORT_SPECS = (
     DEFAULT_DENSE_SPEC,
     *VALIDATED_MODEL_SUPPORT_SPECS,
@@ -301,6 +326,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.dsv4",
         "DSV4_HANDLER",
     ),
+    _GLM52_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.glm52",
+        "GLM52_HANDLER",
+    ),
     _GPT_OSS_MOE_HANDLER_KEY: (
         "art.megatron.model_support.handlers.gpt_oss",
         "GPT_OSS_MOE_HANDLER",
@@ -340,6 +369,7 @@ QWEN3_5_MODELS = QWEN3_5_DENSE_MODELS | QWEN3_5_MOE_MODELS
 GEMMA4_MOE_MODELS = frozenset(GEMMA4_MOE_SPEC.model_names)
 GEMMA4_DENSE_MODELS = frozenset(GEMMA4_DENSE_SPEC.model_names)
 DSV4_MODELS = frozenset(DSV4_SPEC.model_names)
+GLM52_MODELS = frozenset(GLM52_SPEC.model_names)
 GPT_OSS_MOE_MODELS = frozenset(GPT_OSS_MOE_SPEC.model_names)
 
 
@@ -362,6 +392,13 @@ def get_model_support_spec(
         "Pass allow_unvalidated_arch=True only for explicit validation/probing. "
         f"Supported models: {supported}."
     )
+
+
+def get_model_support_spec_by_key(key: str) -> ModelSupportSpec:
+    try:
+        return _SPECS_BY_KEY[key]
+    except KeyError as exc:
+        raise KeyError(f"No model support spec registered for {key!r}") from exc
 
 
 def get_model_support_handler(
@@ -445,20 +482,6 @@ def native_vllm_lora_status_for_model(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     ).native_vllm_lora_status
-
-
-def model_requires_merged_rollout(
-    base_model: str,
-    *,
-    allow_unvalidated_arch: bool = False,
-) -> bool:
-    return (
-        get_model_support_spec(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        ).default_rollout_weights_mode
-        == "merged"
-    )
 
 
 def model_uses_expert_parallel(

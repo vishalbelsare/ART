@@ -31,7 +31,6 @@ from .range_ops import (
 )
 from .types import (
     ArtContextParallelState,
-    AttnSlice,
     CpBlockMaskVariant,
     DkvReducePlan,
     ExactMaskMetadata,
@@ -671,6 +670,7 @@ class FlexAttentionKernel:
         backend = flex_backend_for_head_dims(
             head_dim=int(q.shape[-1]),
             head_dim_v=int(v.shape[-1]),
+            device=q.device,
         )
         if compile_key is None:
             _q_len, _k_len, compile_key = select_sparse_execution_family(
@@ -688,6 +688,7 @@ class FlexAttentionKernel:
                 head_dim=int(q.shape[-1]),
                 head_dim_v=int(v.shape[-1]),
                 triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
+                device=q.device,
             )
         )
         prepare_sparse_flex_attention(

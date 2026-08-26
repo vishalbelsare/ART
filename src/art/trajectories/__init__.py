@@ -538,6 +538,7 @@ class Trajectory(_CompactModel):
     metadata: dict[str, MetadataValue] = pydantic.Field(default_factory=dict)
     logs: list[str] = pydantic.Field(default_factory=list)
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
+    _policy_token_counts: dict[int, int] | None = pydantic.PrivateAttr(default=None)
 
     @pydantic.field_serializer("messages_and_choices", when_used="json")
     def serialize_messages_and_choices(self, value: MessagesAndChoices) -> list[Any]:
@@ -554,9 +555,6 @@ class Trajectory(_CompactModel):
                 "A trajectory cannot contain both exchanges and legacy histories"
             )
         return self
-
-    def _intern_strings(self, pool: _StringPool | None = None) -> None:
-        _intern_string_graph(self, pool)
 
     def compact_dump(self) -> CompactTrajectoryPayload:
         """Return the explicit string-table representation of this trajectory."""
@@ -853,6 +851,9 @@ class TrajectoryGroup(_CompactModel):
     logs: list[str] = pydantic.Field(default_factory=list)
     _collect_packing_shape: bool = pydantic.PrivateAttr(default=False)
     _packed_group_shape: Any = pydantic.PrivateAttr(default=None)
+    _distributed_lease: Any = pydantic.PrivateAttr(default=None)
+    _prepared_training_batch: Any = pydantic.PrivateAttr(default=None)
+    _prepared_log_path: str | None = pydantic.PrivateAttr(default=None)
 
     def _intern_strings(self, pool: _StringPool | None = None) -> None:
         _intern_string_graph(self, pool)
@@ -1171,7 +1172,7 @@ class TokenizedMultiHistoryTrajectory(_StringInterningModel):
         self.trajectory.metadata = value
 
     @pydantic.model_validator(mode="after")
-    def _intern_source_graph(self) -> TokenizedMultiHistoryTrajectory:
+    def _bind_source_graph(self) -> TokenizedMultiHistoryTrajectory:
         for history in self.histories:
             _rebind_history_sources(history.history, self.trajectory)
         return self
@@ -1217,7 +1218,7 @@ class TokenizedTrajectoryGroup(_StringInterningModel, Generic[TokenizedTrajector
         self.trajectory_group.metadata = value
 
     @pydantic.model_validator(mode="after")
-    def _intern_source_graph(self) -> TokenizedTrajectoryGroup[TokenizedTrajectoryT]:
+    def _bind_source_graph(self) -> TokenizedTrajectoryGroup[TokenizedTrajectoryT]:
         if len(self.trajectories) != len(self.trajectory_group.trajectories):
             raise ValueError("Tokenized group differs in length from its source group")
         for tokenized, trajectory in zip(
@@ -1267,6 +1268,13 @@ CompactDumpable: TypeAlias = Union[
     "TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]",
 ]
 _CompactValidated: TypeAlias = Union[CompactDumpable, list[CompactDumpable]]
+
+
+def compact_memory[T](value: T) -> T:
+    """Deduplicate equal strings in a supported object graph in place."""
+
+    _intern_string_graph(value)
+    return value
 
 
 def compact_dump(
@@ -1439,6 +1447,7 @@ __all__ = [
     "CompactDumpable",
     "CompactTrajectoryKind",
     "CompactTrajectoryPayload",
+    "compact_memory",
     "compact_dump",
     "compact_validate",
     "current_trajectory",

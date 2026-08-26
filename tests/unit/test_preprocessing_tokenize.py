@@ -5,10 +5,14 @@ import pydantic
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
-from art.preprocessing.tokenize import tokenize_sft_batch
+from art.preprocessing.tokenize import (
+    _normalize_tool_call_arguments_for_chat_template,
+    tokenize_sft_batch,
+)
 from art.trajectories import Trajectory
 from art.types import MessagesAndChoices, TrainSFTConfig
 from art.utils.chat_template import (
+    TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR,
     chat_template_with_preserved_thinking,
     default_chat_template_kwargs_for_template,
     normalize_tool_call_arguments_for_chat_template,
@@ -315,6 +319,71 @@ class _NonPrefixStableTokenizer(_LastAssistantTokenizer):
         ):
             return f"<changed>{rendered}"
         return rendered
+
+
+def test_glm_chat_template_normalizes_aliased_tool_call_arguments() -> None:
+    tokenizer = _FakeTokenizer()
+    tokenizer.chat_template = (
+        "{% for tc in message.tool_calls %}"
+        "{% set _args = tc.function.arguments %}"
+        "{% for name, value in _args.items() %}{{ name }}{{ value }}{% endfor %}"
+        "{% endfor %}"
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "answer",
+                        "arguments": '{"value": "yes"}',
+                    }
+                }
+            ],
+        }
+    ]
+
+    normalized = _normalize_tool_call_arguments_for_chat_template(
+        tokenizer,
+        messages,
+    )
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"value": "yes"}
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == ('{"value": "yes"}')
+
+
+@pytest.mark.parametrize("handler_name", ["GEMMA4_DENSE_HANDLER", "GEMMA4_MOE_HANDLER"])
+def test_gemma4_normalizes_json_tool_arguments_for_mapping_template(
+    handler_name: str,
+) -> None:
+    pytest.importorskip("megatron")
+    from art.megatron.model_support.handlers import gemma4
+
+    handler = getattr(gemma4, handler_name)
+    tokenizer = _FakeTokenizer()
+    tokenizer.chat_template = (
+        "{% set function = tool_call['function'] %}"
+        "{% if function['arguments'] is mapping %}{{ function['arguments'] }}{% endif %}"
+    )
+    handler.configure_tokenizer(tokenizer, internal_config={})
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "answer",
+                        "arguments": '{"value": "yes"}',
+                    }
+                }
+            ],
+        }
+    ]
+
+    normalized = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
+
+    assert getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR) is True
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"value": "yes"}
 
 
 def test_legacy_qwen_template_gains_opt_in_thinking_preservation() -> None:

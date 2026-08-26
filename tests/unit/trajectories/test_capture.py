@@ -879,7 +879,6 @@ async def test_native_openai_chat_stream_captures_at_done_event() -> None:
 
     assert len(chunks) == 1
     assert chunks[0].choices[0].delta.content == "hello"
-    await stream.close()
     assert len(trajectory.exchanges.chat_completions) == 1
     await client.close()
 
@@ -941,7 +940,6 @@ async def test_native_async_openai_preloaded_chat_stream_captures_once() -> None
 
     assert len(chunks) == 1
     assert chunks[0].choices[0].delta.content == "hello"
-    await stream.close()
     assert len(trajectory.exchanges.chat_completions) == 1
     await client.close()
 

@@ -132,9 +132,7 @@ def validate(
             _validate_value(item, singular, target_model, device=device)
             for item in data
         ]
-        for value in values:
-            _finish(value)
-        return cast(_CompactValidated, values)
+        return cast(_CompactValidated, [_finish(value) for value in values])
     return _finish(_validate_value(data, kind, target_model, device=device))
 
 

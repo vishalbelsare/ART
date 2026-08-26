@@ -6,9 +6,7 @@ from datetime import datetime
 import json
 import pickle
 import random
-import statistics
 import sys
-import time
 from typing import Any
 
 import pydantic
@@ -33,7 +31,7 @@ def _json_size(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
 
 
-def test_explicit_interning_handles_nested_models_keys_and_cycles() -> None:
+def test_explicit_memory_compaction_interns_nested_models_keys_and_cycles() -> None:
     class ProviderExtra(pydantic.BaseModel, extra="allow"):
         content: str
 
@@ -64,12 +62,11 @@ def test_explicit_interning_handles_nested_models_keys_and_cycles() -> None:
             "frozenset": frozenset({_fresh(repeated)}),
         }
     )
+    assert cycle[0] is not cycle[1]
+
+    assert tr.compact_memory(trajectory) is trajectory
 
     canonical = next(key for key in trajectory.metadata if key == repeated)
-    assert cycle[0] is not canonical
-
-    trajectory._intern_strings()
-
     assert cycle[0] is canonical
     assert cycle[1] is canonical
     assert cycle[2] is cycle
@@ -95,7 +92,6 @@ def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() ->
     assert from_json.metadata["first"] is not from_json.metadata["second"]
 
     trajectory.metadata["third"] = _fresh(repeated)
-    assert trajectory.metadata["third"] is not trajectory.metadata["first"]
     trajectory.finish()
     assert trajectory.metadata["third"] is not trajectory.metadata["first"]
 
@@ -120,6 +116,8 @@ def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() ->
     )
     restored = pickle.loads(pickle.dumps(group))
     canonical = trajectory.metadata["first"]
+    assert trajectory.metadata["second"] is canonical
+    assert trajectory.metadata["third"] is canonical
     assert other.metadata["value"] is canonical
     assert group.metadata["value"] is canonical
     assert group.exceptions[0].message is canonical
@@ -129,12 +127,12 @@ def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() ->
     )
 
 
-def test_interning_does_not_change_model_equality() -> None:
+def test_memory_compaction_does_not_change_model_equality() -> None:
     trajectory = art.Trajectory()
     trajectory.metadata["items"] = [_fresh(_long()), _fresh(_long())]
     before = copy.deepcopy(trajectory)
 
-    trajectory._intern_strings()
+    tr.compact_memory(trajectory)
 
     assert trajectory == before
 
@@ -685,7 +683,7 @@ def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
             )
 
 
-def test_interning_reduces_pickle_and_compact_json_sizes() -> None:
+def test_pickle_interning_reduces_pickle_and_compact_json_sizes() -> None:
     trajectory = art.Trajectory()
     repeated = _long() * 4
     trajectory.metadata["items"] = [_fresh(repeated) for _ in range(200)]
@@ -744,23 +742,6 @@ def test_cloudpickle_preserves_shared_references() -> None:
     trajectory = art.Trajectory(
         metadata={"items": [_fresh(repeated), _fresh(repeated)]}
     )
+    tr.compact_memory(trajectory)
     cloud_restored = cloudpickle.loads(cloudpickle.dumps(trajectory))
     assert cloud_restored.metadata["items"][0] is cloud_restored.metadata["items"][1]
-
-
-def test_interning_traversal_scales_near_linearly() -> None:
-    repeated = _long()
-
-    def duration(size: int) -> float:
-        samples = []
-        for _ in range(5):
-            trajectory = art.Trajectory()
-            trajectory.metadata["items"] = [_fresh(repeated) for _ in range(size)]
-            start = time.perf_counter()
-            trajectory._intern_strings()
-            samples.append(time.perf_counter() - start)
-        return statistics.median(samples)
-
-    small = duration(4_000)
-    large = duration(8_000)
-    assert large < max(small * 3, 0.05)

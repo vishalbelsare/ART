@@ -140,9 +140,11 @@ def _routed_exchange(
     extra[ART_MOE_ROUTING_METADATA_KEY] = {
         "prompt_token_ids": prompt_token_ids,
         "completion_token_ids": [output_token],
+        "num_experts": 2048,
         "routed_experts": np.asarray(
-            [[[10]]] * len(prompt_token_ids) + [[[output_token * 10]]],
-            dtype=np.int32,
+            [[[token_id * 10]] for token_id in prompt_token_ids]
+            + [[[output_token * 10]]],
+            dtype=np.uint16,
         ),
     }
     return exchange
@@ -721,8 +723,9 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     first_extra[ART_MOE_ROUTING_METADATA_KEY] = {
         "prompt_token_ids": [1],
         "completion_token_ids": [2, 101, 102, 9],
+        "num_experts": 2048,
         "routed_experts": np.asarray(
-            [[[10]], [[20]], [[1010]], [[1020]], [[90]]], dtype=np.int32
+            [[[10]], [[20]], [[1010]], [[1020]], [[90]]], dtype=np.uint16
         ),
     }
 
@@ -758,9 +761,10 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     second_extra[ART_MOE_ROUTING_METADATA_KEY] = {
         "prompt_token_ids": [1, 101, 102, 9, 4],
         "completion_token_ids": [5, 6],
+        "num_experts": 2048,
         "routed_experts": np.asarray(
             [[[10]], [[1010]], [[1020]], [[90]], [[40]], [[50]], [[60]]],
-            dtype=np.int32,
+            dtype=np.uint16,
         ),
     }
 
@@ -821,7 +825,7 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     assert all(result.weight == pytest.approx(1 / 6) for result in results)
     expected_routes = np.asarray(
         [[[10]], [[1010]], [[1020]], [[90]], [[40]], [[50]], [[60]]],
-        dtype=np.int32,
+        dtype=np.uint16,
     )
     for result in stripped:
         assert isinstance(result.moe_routed_experts, MoeRouteSegments)

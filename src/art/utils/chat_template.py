@@ -6,6 +6,7 @@ THINKING_CHAT_TEMPLATE_KWARGS: dict[str, Any] = {
     "enable_thinking": False,
     "preserve_thinking": True,
 }
+TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR = "_art_tool_call_arguments_as_mapping"
 _QWEN_DROP_PRIOR_THINKING = "{%- if loop.index0 > ns.last_query_index %}"
 _QWEN_PRESERVE_PRIOR_THINKING = (
     "{%- if (preserve_thinking is defined and preserve_thinking is true) or "
@@ -88,13 +89,17 @@ def _template_requires_structured_tool_arguments(chat_template: object) -> bool:
 def normalize_tool_call_arguments_for_chat_template(
     messages: list[dict[str, Any]],
     chat_template: object,
+    *,
+    require_mapping: bool = False,
 ) -> list[dict[str, Any]]:
     """Give chat templates the structured tool arguments they require.
 
     Templates that interpolate the raw JSON string must keep string arguments,
     so only templates that iterate structured arguments trigger normalization.
     """
-    if not _template_requires_structured_tool_arguments(chat_template):
+    if not require_mapping and not _template_requires_structured_tool_arguments(
+        chat_template
+    ):
         return messages
     normalized: list[dict[str, Any]] = []
     for message in messages:
