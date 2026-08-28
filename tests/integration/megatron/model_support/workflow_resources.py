@@ -425,6 +425,9 @@ _B300_THROUGHPUT_FLOORS = {
         (81_700, 76_400, 4_850, 0.88, 2.5),
     ),
 }
+_B300_THROUGHPUT_FINGERPRINT_OVERRIDES = {
+    "Qwen/Qwen3.8-27B": "b07ee7ec6338ec021463a43a90fc96c5c5a036b4a04d90b80e1d22c1eef86774",
+}
 _H200_THROUGHPUT_FLOORS = {
     "llama3_dense": (18_300, 17_200, 4_400, 0.89, 7.0),
     "qwen3_dense": (24_100, 23_100, 5_000, 0.91, 7.0),
@@ -554,7 +557,22 @@ def handler_workflow_resources_for_base_model(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    return HANDLER_WORKFLOW_RESOURCES.get(spec.handler_key)
+    resources = HANDLER_WORKFLOW_RESOURCES.get(spec.handler_key)
+    fingerprint = _B300_THROUGHPUT_FINGERPRINT_OVERRIDES.get(base_model)
+    if resources is None or resources.e2e_throughput is None or fingerprint is None:
+        return resources
+    stage = resources.e2e_throughput
+    config = stage.throughput
+    if config is None:
+        raise RuntimeError(f"missing throughput config for {base_model}")
+    thresholds = dict(config.thresholds)
+    thresholds["b300"] = thresholds["b300"].model_copy(
+        update={"calibration_fingerprint": fingerprint}
+    )
+    config = config.model_copy(update={"thresholds": thresholds})
+    return resources.model_copy(
+        update={"e2e_throughput": stage.model_copy(update={"throughput": config})}
+    )
 
 
 def _h200_equivalent_slots_for_total_gib(total_gib: float) -> int:
