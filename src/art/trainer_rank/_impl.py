@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import (
     Callable,
     Iterable,
@@ -14,10 +15,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+import hashlib
 import math
 import os
 from pathlib import Path
+import struct
 import threading
+import time
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
@@ -43,7 +47,15 @@ from art.megatron.prefix_tree_packing import (
     PrefixTreePack,
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
-    prefix_tree_pack,
+)
+from art.trainer_rank._planner_cost import COEFFICIENT_VERSION
+from art.trainer_rank._prefix_tree_materializer import materialize_prefix_tree_layout
+from art.trainer_rank._prefix_tree_planner import (
+    CanonicalPrefixTree,
+    PrefixTreeLayout,
+    build_canonical_prefix_tree,
+    prefix_tree_layout_candidates,
+    select_prefix_tree_layout,
 )
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
@@ -92,6 +104,26 @@ T = TypeVar("T")
 ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
 _MEMORY_PROFILE_TRUST_GROWTH = 8
+
+# Internal calibrated planner policy. These are deliberately not user knobs:
+# prefix sharing, head chunking, and memory margins are planner decisions.
+_MEMORY_SAFETY_FACTOR = 1.10
+_MEMORY_RESERVE_FRACTION = 0.03
+_HEAD_CHUNK_TOKENS = 512
+_PLANNER_REFINEMENT_BUDGET = 2_000
+_LAYOUT_SELECTION_CACHE_LIMIT = 64
+
+# Test-only layout anchor forcing for paired acceptance measurement. Both
+# variables must be set; the hook is inert in production.
+_TEST_HOOKS_ENV = "ART_TRAINER_RANK_TEST_HOOKS"
+_TEST_ANCHOR_ENV = "ART_TRAINER_RANK_TEST_ANCHOR"
+
+_U64_STRUCT = struct.Struct("<Q")
+
+# Layout selected when the cost-optimal layout cannot be admitted: full sharing
+# minimizes packed tokens, and its packed count is monotone in wave width, so
+# it is the feasibility predicate the width search relies on.
+_MEMORY_MINIMAL_ANCHOR = "full_sharing"
 _CHECKPOINT_PREFETCH_EXECUTOR: tuple[int, ThreadPoolExecutor] | None = None
 _CHECKPOINT_PREFETCH_EXECUTOR_LOCK = threading.Lock()
 
@@ -461,7 +493,47 @@ class MicroBatchStats:
 
 
 class TrainerRankMemoryError(RuntimeError):
-    pass
+    """Bounded conservative planning could not safely admit this call.
+
+    This is not an infeasibility proof: it means the planner's bounded search
+    and conservative admission margin found no plan predicted to fit. The
+    error reports only what the caller can act on.
+    """
+
+    predicted_peak_bytes: int
+    usable_limit_bytes: int
+    suggestion: str
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        predicted_peak_bytes: int = 0,
+        usable_limit_bytes: int = 0,
+        suggestion: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.predicted_peak_bytes = predicted_peak_bytes
+        self.usable_limit_bytes = usable_limit_bytes
+        self.suggestion = suggestion
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # Keyword-only fields do not survive the default Exception reduce;
+        # carry them as state so pickling across process boundaries keeps the
+        # actionable numbers.
+        return (
+            type(self),
+            (self.args[0] if self.args else "",),
+            {
+                "predicted_peak_bytes": self.predicted_peak_bytes,
+                "usable_limit_bytes": self.usable_limit_bytes,
+                "suggestion": self.suggestion,
+            },
+        )
+
+
+class TrainerRankRuntimeSupportError(RuntimeError):
+    """The current topology or runtime capability is not yet supported."""
 
 
 class TrainerRankSlotStateError(RuntimeError):
@@ -479,6 +551,7 @@ class _MemoryCheck:
 class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
+    logical_per_packed: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -769,7 +842,7 @@ type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
 @dataclass(frozen=True)
 class _MemorySignature:
     topology: tuple[int, int, int, int]
-    shared_prefix_max_depth: int
+    planner_coefficients: int
     slot_group_count: int
     request_mix: tuple[str, ...]
     grad_enabled: bool
@@ -794,38 +867,61 @@ class _FlatForwardPlan:
     logical_tokens: int
     output_bytes: int
     signature: _MemorySignature
+    selected_max_depth: int = 0
+
+
+def _wave_geometry(item_count: int, start: int, dp_size: int) -> tuple[int, int, int]:
+    """Return (remaining, min_width, granularity) for a wave starting at start."""
+
+    remaining = item_count - start
+    min_width = min(dp_size, remaining)
+    base_granularity = 1 if remaining < 64 else 8 if remaining < 256 else 32
+    granularity = max(1, ((base_granularity + dp_size - 1) // dp_size) * dp_size)
+    return remaining, min_width, granularity
+
+
+def _normalize_wave_width(
+    width: int, min_width: int, remaining: int, granularity: int
+) -> int:
+    width = max(min_width, min(width, remaining))
+    if width in (min_width, remaining) or granularity <= 1:
+        return width
+    if width < granularity:
+        return width
+    return max(min_width, (width // granularity) * granularity)
+
+
+def _local_wave_indices(
+    start: int, width: int, dp_rank: int, dp_size: int
+) -> tuple[int, ...]:
+    """This DP rank's strided share of the global wave [start, start + width)."""
+
+    return tuple(range(start + dp_rank, start + width, dp_size))
 
 
 class TrainerRank:
-    def __init__(
-        self,
-        runtime: TrainingRuntime,
-        *,
-        head_chunk_tokens: int = 512,
-        shared_prefix_max_depth: int = 1,
-        memory_safety_factor: float = 1.10,
-        memory_reserve_fraction: float = 0.03,
-    ) -> None:
+    def __init__(self, runtime: TrainingRuntime) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
         if pp_size > 1 or len(runtime.model) > 1:
-            raise NotImplementedError(
+            raise TrainerRankRuntimeSupportError(
                 "TrainerRank does not use the MCore forward/backward schedule and "
                 "therefore requires PP=1 with exactly one local model chunk; "
                 f"got pp={pp_size}, chunks={len(runtime.model)}"
             )
-        if head_chunk_tokens < 1:
-            raise ValueError("head_chunk_tokens must be >= 1")
-        if shared_prefix_max_depth < 0:
-            raise ValueError("shared_prefix_max_depth must be >= 0")
-        if memory_safety_factor < 1.0:
-            raise ValueError("memory_safety_factor must be >= 1.0")
-        if not (0.0 <= memory_reserve_fraction < 1.0):
-            raise ValueError("memory_reserve_fraction must be in [0, 1)")
+        tp_size = int(getattr(runtime.provider, "tensor_model_parallel_size", 1) or 1)
+        try:
+            from megatron.core import parallel_state as ps
+
+            tp_size = max(tp_size, int(ps.get_tensor_model_parallel_world_size()))
+        except (AssertionError, ImportError, RuntimeError, ValueError):
+            pass
+        if tp_size > 1:
+            raise TrainerRankRuntimeSupportError(
+                "TrainerRank automatic planning currently requires TP=1: the "
+                "planner's admission model is not yet calibrated for "
+                f"tensor-parallel execution (got tp={tp_size})"
+            )
         self.runtime: TrainingRuntime = runtime
-        self.head_chunk_tokens = head_chunk_tokens
-        self.shared_prefix_max_depth = shared_prefix_max_depth
-        self.memory_safety_factor = memory_safety_factor
-        self.memory_reserve_fraction = memory_reserve_fraction
         self.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
         try:
@@ -872,6 +968,20 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._last_global_micro_batch_size: int | None = None
+        # Bounded LRU: steady-state hits are temporally local (identical
+        # content on consecutive calls); fresh-token training steps must not
+        # accumulate entries for the lifetime of the rank.
+        self._layout_selection_cache: OrderedDict[
+            tuple[str, int, int, bool, int, str | None],
+            tuple[CanonicalPrefixTree, PrefixTreeLayout],
+        ] = OrderedDict()
+        self._tree_cache: OrderedDict[str, CanonicalPrefixTree] = OrderedDict()
+        self._layout_cache_lock = threading.Lock()
+        self._speculative_planner: ThreadPoolExecutor | None = None
+        self._speculative_planning_future: Future[None] | None = None
+        self._planning_seconds_accum = 0.0
+        self._speculative_planning_seconds = 0.0
+        self._last_forward_telemetry_snapshot: dict[str, float | int] | None = None
         self.zero_grad()
 
     def zero_grad(self) -> None:
@@ -1635,6 +1745,7 @@ class TrainerRank:
             for index in indices:
                 self._forward_item(requests[index])
         start = 0
+        self._reset_planning_telemetry()
         while start < len(items):
             with _telemetry_phase(
                 "plan",
@@ -1655,6 +1766,13 @@ class TrainerRank:
                     self._last_global_micro_batch_size or 0,
                     candidate.stats_global_count,
                 )
+                # Overlap next-wave planning with the caller's GPU time: the
+                # width search seeds from the last wave's width, so pre-plan
+                # that slice while this generator is suspended at the yield.
+                self._submit_speculative_wave_planning(
+                    items, stop, checkpoint=checkpoint
+                )
+            self._snapshot_planning_telemetry(candidate.plan)
             with _telemetry_phase(
                 # This interval is controlled by the caller and normally contains
                 # loss construction and backward for the yielded microbatch.
@@ -1749,11 +1867,19 @@ class TrainerRank:
     ) -> ForwardOutputs:
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
+            self._reset_planning_telemetry()
             materialized = _materialize(inputs)
-            plan = self._plan_flat_forward(
-                list(_flatten(materialized)), checkpoint=checkpoint
-            )
+            requests = list(_flatten(materialized))
+            plan = self._plan_flat_forward(requests, checkpoint=checkpoint)
             check = self._memory_check(plan)
+            if not check.fits:
+                # Best effort before refusing: the memory-minimal (full
+                # sharing) layouts may fit where the cost-optimal ones do not.
+                plan = self._plan_flat_forward(
+                    requests, checkpoint=checkpoint, memory_minimal=True
+                )
+                check = self._memory_check(plan)
+            self._snapshot_planning_telemetry(plan)
             if not check.fits:
                 self._raise_memory_error(
                     plan,
@@ -1769,6 +1895,36 @@ class TrainerRank:
             )
             outputs = iter(tracked_outputs)
             return _unflatten(materialized, outputs)
+
+    def _reset_planning_telemetry(self) -> None:
+        self._planning_seconds_accum = 0.0
+        with self._layout_cache_lock:
+            self._speculative_planning_seconds = 0.0
+
+    def _snapshot_planning_telemetry(self, plan: _FlatForwardPlan) -> None:
+        with self._layout_cache_lock:
+            speculative_seconds = self._speculative_planning_seconds
+        self._last_forward_telemetry_snapshot = {
+            "planning_ms": self._planning_seconds_accum * 1_000.0,
+            "speculative_planning_ms": speculative_seconds * 1_000.0,
+            "selected_max_depth": plan.selected_max_depth,
+        }
+
+    def last_forward_telemetry(self) -> dict[str, float | int]:
+        """Concise planner telemetry for the most recent planned forward.
+
+        ``planning_ms`` is critical-path planning accumulated across the whole
+        public call (all waves of ``forward_micro_batches``, including the
+        synchronous cost of submitting speculative work);
+        ``speculative_planning_ms`` is worker CPU time hidden under the
+        caller's GPU work; ``selected_max_depth`` describes the most recently
+        materialized plan. The snapshot is taken before admission, so a call
+        refused with ``TrainerRankMemoryError`` is still reflected.
+        """
+
+        if self._last_forward_telemetry_snapshot is None:
+            raise RuntimeError("no forward has completed planning yet")
+        return dict(self._last_forward_telemetry_snapshot)
 
     def dp_reduce(
         self,
@@ -2422,58 +2578,129 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
     ) -> _CandidateMicroBatch[ForwardInputsT]:
         dp_rank, dp_size = self._dp_rank_and_size()
-        remaining = len(items) - start
-        min_width = min(dp_size, remaining)
+        remaining, min_width, granularity = _wave_geometry(len(items), start, dp_size)
         if min_width <= 0:
             raise RuntimeError("cannot select an empty microbatch window")
-        base_granularity = 1 if remaining < 64 else 8 if remaining < 256 else 32
-        granularity = max(
-            1,
-            ((base_granularity + dp_size - 1) // dp_size) * dp_size,
-        )
 
         def normalize(width: int) -> int:
-            width = max(min_width, min(width, remaining))
-            if width in (min_width, remaining) or granularity <= 1:
-                return width
-            if width < granularity:
-                return width
-            return max(min_width, (width // granularity) * granularity)
+            return _normalize_wave_width(width, min_width, remaining, granularity)
 
         def local_slice(width: int) -> tuple[tuple[int, ...], list[ForwardInputsT]]:
-            stop = start + width
-            indices = tuple(range(start + dp_rank, stop, dp_size))
+            indices = _local_wave_indices(start, width, dp_rank, dp_size)
             return indices, [items[index] for index in indices]
 
         estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
         plans: dict[int, _FlatForwardPlan] = {}
+        # Per-width layout mode chosen by admission: False = cost-optimal,
+        # True = memory-minimal (full sharing). Materialization must build the
+        # same layouts the admitted estimate priced.
+        layout_modes: dict[int, bool] = {}
+        exact_failed_width: int | None = None
 
         def estimate(width: int) -> tuple[_MemoryCheck, bool, bool] | None:
+            nonlocal exact_failed_width
             width = normalize(width)
             if width in estimates:
                 return estimates[width]
             indices, local_inputs = local_slice(width)
-            values = self._estimate_flat_forward(
-                list(_flatten(local_inputs)), checkpoint=checkpoint
-            )
+            local_requests = list(_flatten(local_inputs))
+            values = self._estimate_flat_forward(local_requests, checkpoint=checkpoint)
             if not self._all_ranks_true(values is not None):
                 estimates[width] = None
                 return None
             assert values is not None
-            packed_tokens, output_bytes, signature = values
-            result = (
-                self._memory_check_required(
-                    self._estimate_required_memory_bytes_from_values(
-                        packed_tokens=packed_tokens,
-                        output_bytes=output_bytes,
-                        signature=signature,
+            logical_tokens = sum(
+                int(request.input_tokens.numel()) for request in local_requests
+            )
+
+            def priced(
+                packed_tokens: int,
+                output_bytes: int,
+                signature: _MemorySignature,
+            ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
+                return (
+                    self._memory_check_required(
+                        self._estimate_required_memory_bytes_from_values(
+                            packed_tokens=packed_tokens,
+                            output_bytes=output_bytes,
+                            signature=signature,
+                            logical_tokens=logical_tokens,
+                        ),
+                        sync_across_dp=True,
                     ),
-                    sync_across_dp=True,
-                ),
-                self._all_ranks_have_memory_profile(
-                    packed_tokens=packed_tokens,
-                    signature=signature,
-                ),
+                    packed_tokens,
+                    output_bytes,
+                    signature,
+                )
+
+            def priced_estimate(
+                *, exact: bool, memory_minimal: bool
+            ) -> tuple[_MemoryCheck, int, int, _MemorySignature] | None:
+                estimated = self._estimate_flat_forward(
+                    local_requests,
+                    checkpoint=checkpoint,
+                    exact=exact,
+                    memory_minimal=memory_minimal,
+                )
+                return None if estimated is None else priced(*estimated)
+
+            def trusted(packed_tokens: int, signature: _MemorySignature) -> bool:
+                return self._all_ranks_have_memory_profile(
+                    packed_tokens=packed_tokens, signature=signature
+                )
+
+            # The cheap no-sharing count is an upper bound on any planner
+            # layout: valid for accepting a width (memory and profile trust),
+            # never for rejecting one. Exact pricing runs when the bound would
+            # reject on memory, or when it would reject on profile trust while
+            # a profile exists — the selected layout may be far smaller than
+            # the bound and squarely inside the profiled regime.
+            selected = priced(*values)
+            profiled = self._all_ranks_true(selected[3] in self._memory_profiles)
+            needs_exact = not selected[0].fits or (
+                profiled and not trusted(selected[1], selected[3])
+            )
+            if needs_exact and (
+                exact_failed_width is None or width < exact_failed_width
+            ):
+                # Feasibility must be monotone in width for the outer search:
+                # the cost-optimal layout can decline sharing at one width and
+                # accept it at a wider one, but the memory-minimal (full
+                # sharing) layout's packed count is monotone by construction.
+                # Its cheap bound decides feasibility; planner pricing then
+                # picks cost-optimal when that fits and memory-minimal
+                # otherwise, recording the mode so materialization executes
+                # exactly the layouts that were priced.
+                minimal_bound = priced_estimate(exact=False, memory_minimal=True)
+                if minimal_bound is not None and minimal_bound[0].fits:
+                    for memory_minimal in (False, True):
+                        exact = priced_estimate(
+                            exact=True, memory_minimal=memory_minimal
+                        )
+                        assert exact is not None
+                        selected = exact
+                        if selected[0].fits and (
+                            not profiled or trusted(selected[1], selected[3])
+                        ):
+                            layout_modes[width] = memory_minimal
+                            break
+                    else:
+                        # Nothing fit and trusted; keep the memory-minimal
+                        # pricing so the recorded failure is the monotone one.
+                        if not selected[0].fits:
+                            layout_modes.pop(width, None)
+                elif minimal_bound is not None:
+                    selected = minimal_bound
+                if not selected[0].fits:
+                    exact_failed_width = (
+                        width
+                        if exact_failed_width is None
+                        else min(exact_failed_width, width)
+                    )
+            check, packed_tokens, _output_bytes, signature = selected
+            result = (
+                check,
+                trusted(packed_tokens, signature),
                 self._all_ranks_true(signature in self._memory_profiles),
             )
             estimates[width] = result
@@ -2485,8 +2712,16 @@ class TrainerRank:
             width = normalize(width)
             result = estimate(width)
             if result is None:
+                # Estimator unavailable (device inputs): admit on the
+                # materialized plan, trying the cost-optimal layouts first and
+                # the memory-minimal layouts if those do not fit.
                 plan = materialize(width)
                 check = self._memory_check(plan, sync_across_dp=True)
+                if not check.fits and not layout_modes.get(width, False):
+                    layout_modes[width] = True
+                    plans.pop(width, None)
+                    plan = materialize(width)
+                    check = self._memory_check(plan, sync_across_dp=True)
                 trusted = self._all_ranks_have_memory_profile(
                     packed_tokens=plan.packed_tokens,
                     signature=plan.signature,
@@ -2504,7 +2739,9 @@ class TrainerRank:
             if plan is None:
                 _, local_inputs = local_slice(width)
                 plan = self._plan_flat_forward(
-                    list(_flatten(local_inputs)), checkpoint=checkpoint
+                    list(_flatten(local_inputs)),
+                    checkpoint=checkpoint,
+                    memory_minimal=layout_modes.get(width, False),
                 )
                 plans[width] = plan
             return plan
@@ -2605,24 +2842,258 @@ class TrainerRank:
         except (AssertionError, ImportError, RuntimeError, ValueError):
             return 0, 1
 
+    def _forced_test_anchor(self) -> str | None:
+        if os.environ.get(_TEST_HOOKS_ENV) != "1":
+            return None
+        return os.environ.get(_TEST_ANCHOR_ENV) or None
+
+    def _planner_topology_facts(self) -> tuple[int, int, bool]:
+        cp_size = self._topology_key()[2]
+        uses_gdn = bool(
+            getattr(
+                self.runtime.model_support_handler, "build_gdn_execution_spec", False
+            )
+        )
+        return cp_size, self._num_layers, uses_gdn
+
+    def _layout_anchor(self, *, memory_minimal: bool) -> str | None:
+        """Resolve the layout anchor: test forcing wins, else memory policy."""
+
+        forced = self._forced_test_anchor()
+        if forced is not None:
+            return forced
+        return _MEMORY_MINIMAL_ANCHOR if memory_minimal else None
+
+    def _layout_cache_key(
+        self,
+        input_ids: Sequence[torch.Tensor],
+        *,
+        memory_minimal: bool = False,
+    ) -> tuple[str, int, int, bool, int, str | None]:
+        cp_size, layers, uses_gdn = self._planner_topology_facts()
+        hasher = hashlib.sha256()
+        for tensor in input_ids:
+            row = tensor.detach().reshape(-1).cpu().contiguous()
+            hasher.update(str(row.dtype).encode("ascii"))
+            hasher.update(_U64_STRUCT.pack(int(row.numel())))
+            hasher.update(row.numpy())
+        return (
+            hasher.hexdigest(),
+            cp_size,
+            layers,
+            uses_gdn,
+            COEFFICIENT_VERSION,
+            self._layout_anchor(memory_minimal=memory_minimal),
+        )
+
+    def _cached_group_layout(
+        self,
+        key: tuple[str, int, int, bool, int, str | None],
+    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout] | None:
+        with self._layout_cache_lock:
+            cached = self._layout_selection_cache.get(key)
+            if cached is not None:
+                self._layout_selection_cache.move_to_end(key)
+            return cached
+
+    def _compute_group_layout(
+        self,
+        input_ids: Sequence[torch.Tensor],
+        key: tuple[str, int, int, bool, int, str | None],
+    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
+        """Plan one group and memoize the result.
+
+        Pure with respect to TrainerRank state apart from the caches, so it is
+        safe to run on the speculative planning thread; a concurrent duplicate
+        computation of the same key is deterministic and harmless. The
+        canonical tree is cached by content alone so the cost-optimal and
+        memory-minimal layouts of one group share a single construction.
+        """
+
+        content_key, cp_size, layers, uses_gdn, _, anchor = key
+        with self._layout_cache_lock:
+            tree = self._tree_cache.get(content_key)
+            if tree is not None:
+                self._tree_cache.move_to_end(content_key)
+        if tree is None:
+            tree = build_canonical_prefix_tree(input_ids)
+            with self._layout_cache_lock:
+                self._tree_cache[content_key] = tree
+                while len(self._tree_cache) > _LAYOUT_SELECTION_CACHE_LIMIT:
+                    self._tree_cache.popitem(last=False)
+        if anchor is not None:
+            candidates = prefix_tree_layout_candidates(tree)
+            matching = [
+                candidate for candidate in candidates if anchor in candidate.labels
+            ]
+            if len(matching) != 1:
+                raise ValueError(f"unknown forced layout anchor {anchor!r}")
+            layout = matching[0].layout
+        else:
+            layout = select_prefix_tree_layout(
+                tree,
+                cp_size=cp_size,
+                layers=layers,
+                uses_gdn=uses_gdn,
+                refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
+            ).layout
+        cached = (tree, layout)
+        with self._layout_cache_lock:
+            self._layout_selection_cache[key] = cached
+            self._layout_selection_cache.move_to_end(key)
+            while len(self._layout_selection_cache) > _LAYOUT_SELECTION_CACHE_LIMIT:
+                self._layout_selection_cache.popitem(last=False)
+        return cached
+
+    def _select_group_layout(
+        self,
+        input_ids: Sequence[torch.Tensor],
+        *,
+        memory_minimal: bool = False,
+    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
+        """Select one group's prefix-sharing layout, cached by content identity.
+
+        The cache key is a raw-bytes content hash plus the topology, cost
+        coefficients, and layout anchor, so identical steady-state groups (or
+        groups pre-planned speculatively during the caller's GPU work) skip
+        canonicalization and search entirely. ``memory_minimal`` selects the
+        full-sharing layout instead of the cost-optimal one; the width search
+        uses it when the cost-optimal layout cannot be admitted.
+        """
+
+        started = time.perf_counter()
+        key = self._layout_cache_key(input_ids, memory_minimal=memory_minimal)
+        cached = self._cached_group_layout(key)
+        if cached is None:
+            cached = self._compute_group_layout(input_ids, key)
+        self._planning_seconds_accum += time.perf_counter() - started
+        return cached
+
+    def _speculative_planning_executor(self) -> ThreadPoolExecutor:
+        if self._speculative_planner is None:
+            self._speculative_planner = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="trainer-rank-speculative-planner",
+            )
+        return self._speculative_planner
+
+    def _submit_speculative_wave_planning(
+        self,
+        items: Sequence[ForwardInputs],
+        start: int,
+        *,
+        checkpoint: AdapterSelection,
+    ) -> None:
+        """Pre-plan the predicted next wave while the caller uses the GPU.
+
+        Runs while this generator is suspended at a yield (the caller's
+        forward/backward time). The prediction mirrors the width search
+        exactly: the next wave seeds from the largest width so far and plans
+        this DP rank's strided local slice. Grouping, immutable CPU token
+        snapshots, and cache keys are produced on the calling thread; the
+        worker only runs the pure, memoized planner over those snapshots, so
+        speculation can never change a selected plan and cannot be poisoned by
+        the caller mutating its tensors afterwards. A wrong prediction merely
+        leaves an unused LRU entry. Speculation is skipped for CUDA inputs so
+        the worker never touches the device.
+
+        The synchronous submission cost here is on the critical path (it
+        delays the yield) and is charged to planning telemetry; the worker's
+        hidden CPU time is reported separately as ``speculative_planning_ms``.
+        """
+
+        started = time.perf_counter()
+        try:
+            dp_rank, dp_size = self._dp_rank_and_size()
+            remaining, min_width, granularity = _wave_geometry(
+                len(items), start, dp_size
+            )
+            if min_width <= 0:
+                return
+            width = _normalize_wave_width(
+                self._last_global_micro_batch_size or min_width,
+                min_width,
+                remaining,
+                granularity,
+            )
+            indices = _local_wave_indices(start, width, dp_rank, dp_size)
+            requests = list(_flatten([items[index] for index in indices]))
+            if not requests:
+                return
+            if any(request.input_tokens.device.type != "cpu" for request in requests):
+                return
+            # Slots were ensured for every input when the call began; skip the
+            # ensure-collective so speculation adds no communication.
+            groups = self._group_active_request_indices(
+                requests, checkpoint=checkpoint, ensure_slots=False
+            )
+            pending: list[
+                tuple[
+                    tuple[torch.Tensor, ...],
+                    tuple[str, int, int, bool, int, str | None],
+                ]
+            ] = []
+            for _, group_indices in groups:
+                snapshots = tuple(
+                    requests[index]
+                    .input_tokens.detach()
+                    .reshape(-1)
+                    .to(dtype=torch.long)
+                    .clone()
+                    for index in group_indices
+                )
+                key = self._layout_cache_key(snapshots)
+                if self._cached_group_layout(key) is None:
+                    pending.append((snapshots, key))
+        except Exception:
+            # Prediction is best-effort; the real wave surfaces any genuine
+            # input problem on the main thread.
+            return
+        finally:
+            self._planning_seconds_accum += time.perf_counter() - started
+        if not pending:
+            return
+
+        def warm() -> None:
+            worker_started = time.perf_counter()
+            for snapshots, key in pending:
+                if self._cached_group_layout(key) is None:
+                    self._compute_group_layout(snapshots, key)
+            with self._layout_cache_lock:
+                self._speculative_planning_seconds += (
+                    time.perf_counter() - worker_started
+                )
+
+        self._speculative_planning_future = (
+            self._speculative_planning_executor().submit(warm)
+        )
+
     def _plan_flat_forward(
         self,
         requests: Sequence[AnyForwardInput],
         *,
         checkpoint: AdapterSelection = Unset,
+        memory_minimal: bool = False,
     ) -> _FlatForwardPlan:
         plans: list[_ForwardGroupPlan] = []
         output_bytes = self._estimate_group_request_output_bytes(requests)
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
+        selected_max_depth = 0
         for (slot_ref, grad_enabled), group_indices in groups:
             items = tuple(
                 self._forward_item(requests[index]) for index in group_indices
             )
-            packed = prefix_tree_pack(
-                (item.input_ids for item in items),
-                max_depth=self.shared_prefix_max_depth,
+            group_input_ids = tuple(item.input_ids for item in items)
+            tree, layout = self._select_group_layout(
+                group_input_ids, memory_minimal=memory_minimal
             )
+            selected_max_depth = max(selected_max_depth, layout.maximum_depth)
+            started = time.perf_counter()
+            packed = materialize_prefix_tree_layout(
+                group_input_ids, tree, layout, verify_shared_tokens=False
+            )
+            self._planning_seconds_accum += time.perf_counter() - started
             plans.append(
                 _ForwardGroupPlan(
                     slot_ref=slot_ref,
@@ -2648,6 +3119,7 @@ class TrainerRank:
                 slot_group_count=len(plans),
                 grad_modes=tuple(mode for (_, mode), _ in groups),
             ),
+            selected_max_depth=selected_max_depth,
         )
 
     def _estimate_flat_forward(
@@ -2655,13 +3127,40 @@ class TrainerRank:
         requests: Sequence[AnyForwardInput],
         *,
         checkpoint: AdapterSelection = Unset,
+        exact: bool = False,
+        memory_minimal: bool = False,
     ) -> tuple[int, int, _MemorySignature] | None:
+        """Estimate packed tokens for width probing.
+
+        Cheap mode (``exact=False``) is one O(tokens) CPU walk of the packing
+        primitive and preserves its CUDA None-contract: with
+        ``memory_minimal=False`` it is the no-sharing count, an upper bound on
+        any planner-selected layout (safe for accepting a width); with
+        ``memory_minimal=True`` it is the full-sharing count, the lower bound
+        whose feasibility is monotone in width (valid for rejecting one).
+        ``exact=True`` prices the planner's actual layouts (memoized by
+        content) and is used only inside the band where those bounds disagree.
+        """
+
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
         packed_tokens = 0
         for _, group_indices in groups:
+            if exact:
+                _, layout = self._select_group_layout(
+                    tuple(
+                        requests[index].input_tokens.reshape(-1).to(dtype=torch.long)
+                        for index in group_indices
+                    ),
+                    memory_minimal=memory_minimal,
+                )
+                packed_tokens += layout.packed_tokens
+                continue
+            # Radix depth is bounded by the number of rows, so ``len(group)``
+            # is an unlimited-sharing depth for this group; it is a bound for
+            # estimation, not a sharing policy.
             group_packed_tokens = estimate_prefix_tree_packed_tokens(
                 (requests[index].input_tokens.reshape(-1) for index in group_indices),
-                max_depth=self.shared_prefix_max_depth,
+                max_depth=len(group_indices) if memory_minimal else 0,
             )
             if group_packed_tokens is None:
                 return None
@@ -2677,12 +3176,12 @@ class TrainerRank:
             ),
         )
 
-    def _group_active_request_indices(
+    def _ensure_checkpoint_slots_for(
         self,
         requests: Sequence[AnyForwardInput],
         *,
-        checkpoint: AdapterSelection = Unset,
-    ) -> tuple[tuple[tuple["LoRASlotRef | None", bool], tuple[int, ...]], ...]:
+        checkpoint: AdapterSelection,
+    ) -> None:
         self._ensure_checkpoint_slots(
             cast(str, selection)
             for request in requests
@@ -2702,6 +3201,16 @@ class TrainerRank:
             is not Unset
             and selection is not None
         )
+
+    def _group_active_request_indices(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        ensure_slots: bool = True,
+    ) -> tuple[tuple[tuple["LoRASlotRef | None", bool], tuple[int, ...]], ...]:
+        if ensure_slots:
+            self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
         groups: dict[tuple[LoRASlotRef | None, bool], list[int]] = {}
         for index, request in enumerate(requests):
             if (
@@ -2769,7 +3278,7 @@ class TrainerRank:
     def _telemetry_plan_signature(plan: _FlatForwardPlan) -> dict[str, object]:
         return {
             "topology": plan.signature.topology,
-            "shared_prefix_max_depth": plan.signature.shared_prefix_max_depth,
+            "planner_coefficients": plan.signature.planner_coefficients,
             "slot_group_count": plan.signature.slot_group_count,
             "request_mix": plan.signature.request_mix,
             "grad_enabled": plan.signature.grad_enabled,
@@ -3032,7 +3541,7 @@ class TrainerRank:
         modes = tuple(sorted(grad_modes))
         return _MemorySignature(
             topology=self._topology_key(),
-            shared_prefix_max_depth=self.shared_prefix_max_depth,
+            planner_coefficients=COEFFICIENT_VERSION,
             slot_group_count=slot_group_count,
             request_mix=tuple(
                 sorted({_request_mix_key(request) for request in requests})
@@ -3064,6 +3573,7 @@ class TrainerRank:
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
+                logical_tokens=forward.logical_tokens,
             ),
             sync_across_dp=sync_across_dp,
         )
@@ -3109,15 +3619,20 @@ class TrainerRank:
         context: str,
         message: str,
     ) -> None:
+        suggestion = (
+            "Use smaller top-level items, reduce output requests, or call "
+            "dp_rank_forward with already-DP-local smaller inputs."
+        )
         raise TrainerRankMemoryError(
             f"{context}: {message}. "
             f"packed_tokens={plan.packed_tokens} "
             f"logical_tokens={plan.logical_tokens} "
-            f"output_gb={plan.output_bytes / 1024**3:.3f} "
-            f"estimated_required_gb={check.estimated_required_bytes / 1024**3:.3f} "
-            f"available_gb={check.available_bytes / 1024**3:.3f}. "
-            "Use smaller top-level items, reduce output requests, or call "
-            "dp_rank_forward with already-DP-local smaller inputs."
+            f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
+            f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
+            f"{suggestion}",
+            predicted_peak_bytes=check.estimated_required_bytes,
+            usable_limit_bytes=check.available_bytes,
+            suggestion=suggestion,
         )
 
     def _estimate_required_memory_bytes_from_values(
@@ -3126,6 +3641,7 @@ class TrainerRank:
         packed_tokens: int,
         output_bytes: int,
         signature: _MemorySignature,
+        logical_tokens: int | None = None,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -3137,14 +3653,24 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
+        # A profile learned under lighter sharing (lower logical/packed ratio)
+        # underestimates the per-packed-token footprint of a deeper-shared
+        # plan; scale the trusted estimate up by the ratio gap.
+        ratio_scale = 1.0
+        if profiled is not None and logical_tokens is not None:
+            current_ratio = logical_tokens / max(1, packed_tokens)
+            ratio_scale = max(1.0, current_ratio / profiled.logical_per_packed)
         if (
             profiled is None
             or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
         ):
             compute = static_compute
         else:
-            compute = max(static_compute, int(profiled.bytes_per_token * packed_tokens))
-        return int((output_bytes + compute) * self.memory_safety_factor)
+            compute = max(
+                static_compute,
+                int(profiled.bytes_per_token * packed_tokens * ratio_scale),
+            )
+        return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
     def _available_memory_bytes(self) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
@@ -3153,7 +3679,7 @@ class TrainerRank:
         allocated = int(torch.cuda.memory_allocated(self.device))
         reserved = int(torch.cuda.memory_reserved(self.device))
         reusable_reserved = max(0, reserved - allocated)
-        reserve = int(total * self.memory_reserve_fraction)
+        reserve = int(total * _MEMORY_RESERVE_FRACTION)
         return max(0, int(free) + reusable_reserved - reserve)
 
     def _all_ranks_have_memory_profile(
@@ -3196,6 +3722,10 @@ class TrainerRank:
             packed_tokens=max(
                 plan.packed_tokens,
                 0 if previous is None else previous.packed_tokens,
+            ),
+            logical_per_packed=max(
+                plan.logical_tokens / max(1, plan.packed_tokens),
+                1.0 if previous is None else previous.logical_per_packed,
             ),
         )
 
@@ -3353,7 +3883,7 @@ class TrainerRank:
                 _row_match(
                     positions.cpu(),
                     rows_cpu,
-                    chunk_tokens=self.head_chunk_tokens,
+                    chunk_tokens=_HEAD_CHUNK_TOKENS,
                 )
                 for positions in prepared.positions_by_item
             )
@@ -3378,7 +3908,7 @@ class TrainerRank:
                 logit_bounds=_chunk_boundaries(
                     logit_rows_cpu,
                     end=int(row_tensor.numel()),
-                    chunk_tokens=self.head_chunk_tokens,
+                    chunk_tokens=_HEAD_CHUNK_TOKENS,
                 ),
                 output_weight=output_weight,
                 target_logprobs=target_logprobs,
@@ -3429,9 +3959,9 @@ class TrainerRank:
             item.labels is not None or item.request.top_k is not None for item in items
         )
         for chunk_index, start in enumerate(
-            range(0, int(rows.numel()), self.head_chunk_tokens)
+            range(0, int(rows.numel()), _HEAD_CHUNK_TOKENS)
         ):
-            chunk_rows = rows[start : start + self.head_chunk_tokens]
+            chunk_rows = rows[start : start + _HEAD_CHUNK_TOKENS]
             local_logits = self._local_logits_from_hidden_rows(
                 model,
                 _select_positions(hidden_by_row, chunk_rows),

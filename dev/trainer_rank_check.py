@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import os
@@ -13,6 +14,30 @@ import torch.distributed as dist
 from trainer_rank_diag import all_ranks_checked, rank0_checked
 from trainer_rank_support import load_random_checkpoints
 import typer
+
+from art.trainer_rank._impl import (
+    _TEST_ANCHOR_ENV as ANCHOR_ENV,
+)
+from art.trainer_rank._impl import (
+    _TEST_HOOKS_ENV as ANCHOR_HOOKS_ENV,
+)
+
+
+@contextmanager
+def _forced_anchor(anchor: str) -> Iterator[None]:
+    """Force one layout anchor via the test-only planner hook."""
+
+    if anchor == "automatic":
+        yield
+        return
+    os.environ[ANCHOR_HOOKS_ENV] = "1"
+    os.environ[ANCHOR_ENV] = anchor
+    try:
+        yield
+    finally:
+        os.environ.pop(ANCHOR_HOOKS_ENV, None)
+        os.environ.pop(ANCHOR_ENV, None)
+
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import (
@@ -44,9 +69,8 @@ def main(
     mode: Literal["correctness", "performance"] = "correctness",
     model: str = "Qwen/Qwen3-0.6B",
     layers: int = 1,
-    depths: str = "0,1,2,3,4",
-    performance_depth: int = 1,
-    chunks: str = "17,512,8192",
+    anchors: str = "no_sharing,depth_one,full_sharing,automatic",
+    performance_anchor: str = "automatic",
     workload: Literal["regular", "austin", "varied", "unequal_slots"] = "regular",
     request: Literal["target", "multi", "topk", "logits", "hidden", "mixed"] = "target",
     families: int = 8,
@@ -88,15 +112,14 @@ def main(
             payload = _correctness(
                 runtime,
                 base_model=model,
-                depths=_ints(depths),
-                chunks=_ints(chunks),
+                anchors=tuple(anchors.split(",")),
                 slots=slots,
             )
         else:
             payload = _performance(
                 runtime,
                 base_model=model,
-                depth=performance_depth,
+                anchor=performance_anchor,
                 workload=workload,
                 request=request,
                 families=families,
@@ -125,11 +148,10 @@ def _correctness(
     runtime: Any,
     *,
     base_model: str,
-    depths: tuple[int, ...],
-    chunks: tuple[int, ...],
+    anchors: tuple[str, ...],
     slots: int,
 ) -> dict[str, object]:
-    assert depths and chunks, "depths and chunks must not be empty"
+    assert anchors, "anchors must not be empty"
     rank = TrainerRank(runtime)
     slot_names = load_random_checkpoints(
         runtime,
@@ -138,44 +160,37 @@ def _correctness(
         base_model=base_model,
     )
     requests = _correctness_requests(slot_names)
-    rank.shared_prefix_max_depth = 0
-    rank.head_chunk_tokens = max(chunks)
-    reference = _global_outputs(rank, requests)
+    with _forced_anchor("no_sharing"):
+        reference = _global_outputs(rank, requests)
     worst = Diff()
     grad_worst = Diff()
     slot_grad_worst = Diff()
     rows: list[dict[str, object]] = []
-    for depth in depths:
-        depth_reference: list[dict[str, object]] | None = None
-        for chunk_tokens in chunks:
-            rank.shared_prefix_max_depth = depth
-            rank.head_chunk_tokens = chunk_tokens
+    for anchor in anchors:
+        with _forced_anchor(anchor):
             outputs = _global_outputs(rank, requests)
-            comparison = rank0_checked(
-                f"TrainerRank correctness depth={depth} chunk={chunk_tokens}",
-                lambda: _compare_iteration(outputs, reference, depth_reference),
-            )
-            if dist.get_rank() == 0:
-                assert comparison is not None and outputs is not None
-                independent_diff, chunk_diff = comparison
-                depth_reference = outputs
-                worst = worst.merge(independent_diff).merge(chunk_diff)
-                rows.append(
-                    {
-                        "depth": depth,
-                        "head_chunk_tokens": chunk_tokens,
-                        "independent_mean_abs_pct": independent_diff.mean_abs_pct,
-                        "chunk_mean_abs_pct": chunk_diff.mean_abs_pct,
-                    }
-                )
-                print(rows[-1], flush=True)
-        grad_diff = _head_backward_chunk_parity(
-            rank, requests, depth=depth, chunks=chunks
+        comparison = rank0_checked(
+            f"TrainerRank correctness anchor={anchor}",
+            lambda: _compare_iteration(outputs, reference),
         )
+        if dist.get_rank() == 0:
+            assert comparison is not None and outputs is not None
+            worst = worst.merge(comparison)
+            rows.append(
+                {
+                    "anchor": anchor,
+                    "independent_mean_abs_pct": comparison.mean_abs_pct,
+                }
+            )
+            print(rows[-1], flush=True)
+    # Head chunk parity is anchor-independent; exercise both a shallow and a
+    # deep-shared packing once each instead of once per anchor.
+    for parity_depth in (1, 4):
+        grad_diff = _head_backward_chunk_parity(rank, requests, pack_depth=parity_depth)
         grad_worst = grad_worst.merge(grad_diff)
     if len(slot_names) >= 2:
-        rank.shared_prefix_max_depth = max(depths)
-        slot_grad_worst = _slot_backward_parity(rank, requests, slot_names)
+        with _forced_anchor("full_sharing"):
+            slot_grad_worst = _slot_backward_parity(rank, requests, slot_names)
     return {
         "request_combinations": 16,
         "slots": slots,
@@ -192,24 +207,18 @@ def _correctness(
 def _compare_iteration(
     outputs: list[dict[str, object]] | None,
     reference: list[dict[str, object]] | None,
-    depth_reference: list[dict[str, object]] | None,
-) -> tuple[Diff, Diff]:
+) -> Diff:
     assert outputs is not None and reference is not None
     _assert_topk_only_oracle(outputs)
     _assert_topk_only_oracle(reference)
     _assert_same_logits_topk(outputs)
     _assert_same_logits_topk(reference)
-    return (
-        _compare_outputs(
-            outputs,
-            reference,
-            tolerance=5e-3,
-            topk_tolerance=1e-2,
-            allow_topk_layout_ties=True,
-        ),
-        Diff()
-        if depth_reference is None
-        else _compare_outputs(outputs, depth_reference, tolerance=2e-5),
+    return _compare_outputs(
+        outputs,
+        reference,
+        tolerance=5e-3,
+        topk_tolerance=1e-2,
+        allow_topk_layout_ties=True,
     )
 
 
@@ -489,37 +498,48 @@ def _head_backward_chunk_parity(
     rank: TrainerRank,
     requests: Sequence[ForwardInput],
     *,
-    depth: int,
-    chunks: Sequence[int],
+    pack_depth: int = 1,
 ) -> Diff:
+    from art.trainer_rank import _impl as trainer_rank_impl
+
     active = [
         request
         for request in requests
         if request.target_tokens is not None or request.top_k is not None
     ]
-    rank.shared_prefix_max_depth = depth
-    rank.head_chunk_tokens = chunks[0]
     items = [rank._forward_item(request) for request in active]
     prepared = rank._prepare_packed_forward(
         prefix_tree_pack(
             (item.input_ids for item in items),
-            max_depth=depth,
+            max_depth=pack_depth,
         )
     )
     with torch.no_grad():
         hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
     gradients: list[torch.Tensor] = []
-    for chunk_tokens in (chunks[0], chunks[-1]):
-        rank.head_chunk_tokens = chunk_tokens
-        candidate = hidden.detach().requires_grad_(True)
-        outputs = rank._project_head(items, prepared, candidate)
-        _output_loss(outputs).backward()
-        assert candidate.grad is not None
-        gradients.append(candidate.grad)
+    logprob_sums: list[torch.Tensor] = []
+    original_chunk = trainer_rank_impl._HEAD_CHUNK_TOKENS
+    for chunk_tokens in (17, 8_192):
+        trainer_rank_impl._HEAD_CHUNK_TOKENS = chunk_tokens
+        try:
+            candidate = hidden.detach().requires_grad_(True)
+            outputs = rank._project_head(items, prepared, candidate)
+            loss = _output_loss(outputs)
+            logprob_sums.append(loss.detach())
+            loss.backward()
+            assert candidate.grad is not None
+            gradients.append(candidate.grad)
+        finally:
+            trainer_rank_impl._HEAD_CHUNK_TOKENS = original_chunk
+    forward_diff = _diff(logprob_sums[0], logprob_sums[1])
+    if forward_diff.mean_abs_pct > 2e-3:
+        raise AssertionError(
+            f"head forward chunk parity mean_abs_pct={forward_diff.mean_abs_pct}"
+        )
     diff = _diff(gradients[0], gradients[1])
     if diff.mean_abs_pct > 2e-3:
         raise AssertionError(f"head gradient mean_abs_pct={diff.mean_abs_pct}")
-    return diff
+    return diff.merge(forward_diff)
 
 
 def _slot_backward_parity(
@@ -604,7 +624,7 @@ def _performance(
     runtime: Any,
     *,
     base_model: str,
-    depth: int,
+    anchor: str,
     workload: str,
     request: str,
     families: int,
@@ -619,7 +639,7 @@ def _performance(
 ) -> dict[str, object]:
     if workload == "austin":
         families, prefix_tokens, branches, completion_tokens = 30, 5000, 16, 100
-    rank = TrainerRank(runtime, shared_prefix_max_depth=depth, head_chunk_tokens=8192)
+    rank = TrainerRank(runtime)
     if workload == "unequal_slots":
         _trace_unequal_slots("rank_ready")
     slot_names = load_random_checkpoints(
@@ -652,11 +672,16 @@ def _performance(
             varied=workload == "varied",
             slots=slot_names,
         )
+    if anchor != "automatic":
+        os.environ[ANCHOR_HOOKS_ENV] = "1"
+        os.environ[ANCHOR_ENV] = anchor
     dp_rank, dp_size = rank._dp_rank_and_size()
     plan = rank._plan_flat_forward(requests)
     if workload == "unequal_slots":
         _trace_unequal_slots("plan_ready")
-    assert workload != "austin" or plan.packed_tokens == 198_000
+    assert (
+        workload != "austin" or anchor != "depth_one" or plan.packed_tokens == 198_000
+    )
 
     def step() -> list[MicroBatchStats]:
         if workload == "unequal_slots":
@@ -694,7 +719,7 @@ def _performance(
     median = statistics.median(times)
     free, total = torch.cuda.mem_get_info()
     return {
-        "depth": depth,
+        "anchor": anchor,
         "workload": workload,
         "request": request,
         "adaptive": adaptive,
@@ -844,10 +869,6 @@ def _diff(actual: torch.Tensor, expected: torch.Tensor) -> Diff:
 
 def _cpu(tensor: object) -> torch.Tensor | None:
     return tensor.detach().cpu() if isinstance(tensor, torch.Tensor) else None
-
-
-def _ints(value: str) -> tuple[int, ...]:
-    return tuple(int(item) for item in value.split(",") if item.strip())
 
 
 def _topology() -> dict[str, int]:
