@@ -479,6 +479,7 @@ def _load_hf_model(
     allow_unvalidated_arch: bool,
 ) -> Any:
     from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     from art.megatron.model_support.registry import get_model_support_handler
 
@@ -504,7 +505,25 @@ def _load_hf_model(
         if hf_reference_from_pretrained_kwargs is not None
         else {}
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class = AutoModelForCausalLM
+    prepare_model_class = getattr(handler, "prepare_hf_reference_model_class", None)
+    if prepare_model_class is not None:
+        auto_map = getattr(config, "auto_map", None)
+        class_reference = (
+            auto_map.get(AutoModelForCausalLM.__name__)
+            if isinstance(auto_map, dict)
+            else None
+        )
+        if not isinstance(class_reference, str) or not class_reference:
+            raise RuntimeError("HF reference model class is unavailable")
+        model_class = prepare_model_class(
+            get_class_from_dynamic_module(
+                class_reference,
+                base_model,
+                revision=getattr(config, "_commit_hash", None),
+            )
+        )
+    model = model_class.from_pretrained(
         base_model,
         config=config,
         trust_remote_code=True,
@@ -530,6 +549,47 @@ def _collect_hf_grads(model: Any) -> dict[str, torch.Tensor]:
             grad = torch.zeros_like(param)
         grads[name] = grad.detach().cpu().to(dtype=torch.float32)
     return grads
+
+
+def _accumulate_hf_path_grads(
+    parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    buffers: dict[str, torch.Tensor],
+    loss: torch.Tensor,
+) -> None:
+    if any(parameter.grad is not None for _, parameter in parameters):
+        raise RuntimeError("HF path gradients were not cleared")
+    loss.backward()
+    contributed = False
+    for name, parameter in parameters:
+        grad = parameter.grad
+        if grad is None:
+            continue
+        contributed = True
+        value = grad.detach().float()
+        if name in buffers:
+            buffers[name].add_(value)
+        else:
+            buffers[name] = value
+        parameter.grad = None
+    if not contributed:
+        raise RuntimeError("HF path loss produced no gradients")
+
+
+def _finalize_hf_path_grads(
+    parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    buffers: dict[str, torch.Tensor],
+    token_count: int,
+) -> dict[str, torch.Tensor]:
+    if token_count <= 0 or not buffers:
+        raise RuntimeError("HF path gradient accumulation is empty")
+    return {
+        name: (
+            buffers[name].div_(token_count).cpu()
+            if name in buffers
+            else torch.zeros_like(parameter, dtype=torch.float32, device="cpu")
+        )
+        for name, parameter in parameters
+    }
 
 
 def _collect_hf_state_dict(model: Any) -> dict[str, torch.Tensor]:
@@ -845,7 +905,7 @@ def _hf_requires_recurrent_prefix_paths(
     handler = get_model_support_handler(
         base_model, allow_unvalidated_arch=allow_unvalidated_arch
     )
-    return bool(getattr(handler, "build_gdn_execution_spec", False))
+    return handler.has_recurrent_layers
 
 
 def _prepare_hf_reference_forward(
@@ -905,6 +965,12 @@ def _run_hf_sft_step(
     route_capture = _HfMoeRoutingCapture(model)
     _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
+    path_parameters = tuple(
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if recurrent_prefix_paths and parameter.requires_grad
+    )
+    path_grad_buffers: dict[str, torch.Tensor] = {}
     loss_sum = torch.tensor(0.0, device=device)
     token_count = 0
     trainable_losses: list[torch.Tensor] = []
@@ -928,7 +994,8 @@ def _run_hf_sft_step(
                 sample_index=sample_index,
                 micro_slot=micro_slot,
                 actual_len=actual_len,
-                total_token_count=total_token_count,
+                parameters=path_parameters,
+                grad_buffers=path_grad_buffers,
                 device=device,
                 dtype=dtype,
             )
@@ -972,7 +1039,11 @@ def _run_hf_sft_step(
         loss_sum = loss_sum + masked_losses.sum()
         token_count += int(mask.sum().item())
         (masked_losses.sum() / total_token_count).backward()
-    grads = _collect_hf_grads(model)
+    grads = (
+        _finalize_hf_path_grads(path_parameters, path_grad_buffers, token_count)
+        if recurrent_prefix_paths
+        else _collect_hf_grads(model)
+    )
     hf_reference_state_dict = (
         _normalize_hf_reference_state_for_hf_parity(
             base_model=base_model,
@@ -1010,7 +1081,8 @@ def _run_hf_recurrent_prefix_tree_micro(
     sample_index: int | None,
     micro_slot: int,
     actual_len: int,
-    total_token_count: int,
+    parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    grad_buffers: dict[str, torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -1063,7 +1135,7 @@ def _run_hf_recurrent_prefix_tree_micro(
         claimed_targets.index_copy_(0, selected_uids, path_targets[unclaimed])
         claimed_mask.index_fill_(0, selected_uids, True)
         if selected_losses.numel():
-            (selected_losses.sum() / total_token_count).backward()
+            _accumulate_hf_path_grads(parameters, grad_buffers, selected_losses.sum())
     if not torch.equal(claimed_mask, expected_mask.cpu()):
         missing = torch.where(expected_mask.cpu() & ~claimed_mask)[0].tolist()
         extra = torch.where(claimed_mask & ~expected_mask.cpu())[0].tolist()
@@ -1562,18 +1634,19 @@ def _run_megatron_sft_step(
             prepared_micro.local_token_uids,
             prepared_micro.attention_state,
         )
-        attention_mask = megatron_train._placeholder_attention_mask(device)
-        forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
-            runtime.model[0],
-            attention_bias=prepared_micro.attention_state,
-        )
-        per_token_loss = runtime.model[0](
+        forward_kwargs = dict(
             input_ids=prepared_micro.input_ids,
             position_ids=prepared_micro.position_ids,
-            attention_mask=attention_mask,
+            attention_mask=megatron_train._placeholder_attention_mask(device),
             labels=prepared_micro.labels,
-            **forward_kwargs,
         )
+        forward_kwargs.update(
+            runtime.model_support_handler.get_forward_kwargs(
+                runtime.model[0],
+                attention_bias=prepared_micro.attention_state,
+            )
+        )
+        per_token_loss = runtime.model[0](**forward_kwargs)
         masked_losses = per_token_loss[prepared_micro.loss_mask]
         trainable_losses.append(masked_losses.detach().cpu())
         loss_sum = loss_sum + masked_losses.sum()
@@ -1685,6 +1758,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
                 "position_ids": packed_tensors["input_pos"][index].detach().clone(),
             }
         )
+    del packed_tensors
     zero_template = megatron_train._zero_contribution_sft_inputs(trajectory_tensors[0])
     sample_indices = build_parity_sample_indices(
         num_sequences=len(trajectory_tensors),

@@ -113,10 +113,13 @@ class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
     build_gdn_execution_spec: bool
+    has_recurrent_layers: bool
     cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
+
+    def identity_lora_model_context(self) -> AbstractContextManager[None]: ...
 
     def identity_lora_target_parameters(
         self,
@@ -160,6 +163,12 @@ class ModelSupportHandler(Protocol):
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
+    def prepare_model_for_mixed_precision(
+        self, model_chunks: Sequence[Any]
+    ) -> None: ...
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None: ...
+
     def build_pipeline_microbatch_activator(
         self,
         model_chunks: Sequence[Any],
@@ -192,6 +201,8 @@ class ModelSupportHandler(Protocol):
     def correctness_phase_pass_fns(
         self, oracle_harness: Any
     ) -> dict[str, Any] | None: ...
+
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]: ...
 
     def collect_layer_families(
         self,

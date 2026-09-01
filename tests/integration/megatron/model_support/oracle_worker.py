@@ -484,9 +484,9 @@ def _configure_provider(
     """
     del topology
     provider.num_layers = case_config.num_layers
-    for name in ("moe_layer_freq", "glm52_indexer_types"):
+    for name in ("moe_layer_freq", "glm52_indexer_types", "hybrid_layer_pattern"):
         pattern = getattr(provider, name, None)
-        if isinstance(pattern, (list, tuple)):
+        if isinstance(pattern, (list, tuple, str)):
             setattr(provider, name, type(pattern)(pattern[: case_config.num_layers]))
     if case_config.precision == "fp32":
         provider.bf16 = False
@@ -1208,7 +1208,9 @@ def _patch_lora_for_fp32(
     def _reference_fc1_forward(self: Any, x: torch.Tensor, tokens_per_expert: Any):
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
         adapter_out = (
-            self.lora(x, tokens_per_expert)
+            self.up_lora(x, tokens_per_expert)
+            if self.non_gated
+            else self.lora(x, tokens_per_expert)
             if self.fused_gate_up
             else torch.cat(
                 (
@@ -1262,8 +1264,8 @@ def _mutation_hook(
         raise ValueError(f"Unsupported mutation: {mutation}")
 
     if mutation == "skip_finalize":
-        megatron_train_module.finalize_model_grads_extended = lambda _model, **_kwargs: (
-            None
+        megatron_train_module.finalize_model_grads_extended = (
+            lambda _model, _num_tokens=None, **_kwargs: None
         )
 
     if mutation == "dp_local_token_normalization":
@@ -1272,21 +1274,13 @@ def _mutation_hook(
             micro_inputs: list[Any],
             device: torch.device,
         ) -> torch.Tensor:
-            local_token_total = sum(
-                megatron_train_module._count_trainable_tokens(micro)
-                for micro in micro_inputs
-            )
+            local_token_total = original_local_token_count_tensor(micro_inputs, device)
             dp_world_size = int(
                 megatron_train_module.ps.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
             )
-            wrong_local_token_total = local_token_total / max(dp_world_size, 1)
-            return torch.tensor(
-                [wrong_local_token_total],
-                device=device,
-                dtype=torch.float32,
-            )
+            return local_token_total // max(dp_world_size, 1)
 
         megatron_train_module._local_trainable_token_count_tensor = (
             _wrong_local_trainable_token_count_tensor
@@ -1298,21 +1292,15 @@ def _mutation_hook(
             micro_inputs: list[Any],
             device: torch.device,
         ) -> torch.Tensor:
-            local_token_total = sum(
-                megatron_train_module._count_sft_trainable_tokens(micro)
-                for micro in micro_inputs
+            local_token_total = original_local_sft_token_count_tensor(
+                micro_inputs, device
             )
             dp_world_size = int(
                 megatron_train_module.ps.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
             )
-            wrong_local_token_total = local_token_total / max(dp_world_size, 1)
-            return torch.tensor(
-                [wrong_local_token_total],
-                device=device,
-                dtype=torch.float32,
-            )
+            return local_token_total // max(dp_world_size, 1)
 
         megatron_train_module._local_trainable_sft_token_count_tensor = (
             _wrong_local_trainable_sft_token_count_tensor
@@ -1780,7 +1768,16 @@ def _worker_run(
                 num_sequences=request.packed_tensors.num_sequences,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
-            forward_trace_capture.set_step(step_index, micro_sample_indices)
+            trace_sample_indices = micro_sample_indices
+            if request.mutation == "dp_grad_accumulation_seqs":
+                trace_offset = (
+                    ps.get_data_parallel_rank() * request.packed_tensors.num_sequences
+                )
+                trace_sample_indices = [
+                    None if index is None else index + trace_offset
+                    for index in micro_sample_indices
+                ]
+            forward_trace_capture.set_step(step_index, trace_sample_indices)
             captured_grads = None
             _debug(f"starting step_index={step_index}")
             if request.objective == "rl":
@@ -1858,6 +1855,21 @@ def _worker_run(
                     model_chunks, optimizer_master=True
                 )
                 if rank0:
+                    if request.mutation == "dp_grad_accumulation_seqs":
+                        num_sequences = request.packed_tensors.num_sequences
+                        ordered_micro_sample_indices = [
+                            None if index is None else index % num_sequences
+                            for index in ordered_micro_sample_indices
+                        ]
+                        for calls in _require_not_none(
+                            merged_trace, "merged_trace"
+                        ).values():
+                            for call in calls:
+                                sample_index = call.get("micro_sample_index")
+                                if isinstance(sample_index, int):
+                                    call["micro_sample_index"] = (
+                                        sample_index % num_sequences
+                                    )
                     trace = _trim_trace_padding(
                         _require_not_none(merged_trace, "merged_trace"),
                         valid_lengths=_require_not_none(valid_lengths, "valid_lengths"),

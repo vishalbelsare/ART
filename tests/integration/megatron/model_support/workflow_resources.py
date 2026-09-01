@@ -378,6 +378,17 @@ _THROUGHPUT_CONFIGS = {
         max_num_seqs=48,
         max_steps=21,
     ),
+    "nemotron_h_moe": ThroughputWorkflowConfig(
+        num_layers=39,
+        prompt_tokens=7900,
+        completion_tokens=48,
+        rollouts_per_group=4,
+        groups_per_step=16,
+        initial_model_calls_per_inference_gpu=20,
+        max_num_batched_tokens=98_304,
+        enable_prefix_caching=True,
+        max_steps=17,
+    ),
 }
 
 # Floors are isolated tok/s, E2E tok/s, accepted tok/s, E2E/isolated, and
@@ -424,6 +435,10 @@ _B300_THROUGHPUT_FLOORS = {
         "79572974803f721f65252935f0f53739e3e37110790f6957c6dd6b305a5f0689",
         (81_700, 76_400, 4_850, 0.88, 2.5),
     ),
+    "nemotron_h_moe": (
+        "5354c90678b42636014c02ca315e3997bc6d84101053d488cdd4086cb25d98c8",
+        (40_000, 39_000, 900, 0.92, 4.0),
+    ),
 }
 _B300_THROUGHPUT_FINGERPRINT_OVERRIDES = {
     "Qwen/Qwen3.8-27B": "b07ee7ec6338ec021463a43a90fc96c5c5a036b4a04d90b80e1d22c1eef86774",
@@ -439,6 +454,7 @@ _H200_THROUGHPUT_FLOORS = {
     "dsv4": (8_300, 8_000, 700, 0.90, 12.0),
     "glm52": (9_400, 9_000, 3_400, 0.91, 19.5),
     "gpt_oss_moe": (39_900, 37_100, 2_200, 0.88, 4.5),
+    "nemotron_h_moe": (20_000, 17_000, 400, 0.78, 8.0),
 }
 
 

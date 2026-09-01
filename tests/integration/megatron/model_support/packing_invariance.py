@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from functools import partial
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.mamba.mamba_model import MambaModel
 from pydantic import BaseModel, Field
 import torch
 
@@ -70,6 +72,7 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
         "qwen3_5_moe",
         "dsv4",
         "gpt_oss_moe",
+        "nemotron_h_moe",
     }
 )
 _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
@@ -145,17 +148,31 @@ def _cleanup_distributed_state() -> None:
         torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
 
 
-def _locate_gpt_module(model_chunks: list[Any]) -> GPTModel:
+def _mamba_preprocess(
+    model: MambaModel,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, None]:
+    return model.embedding(input_ids=input_ids, position_ids=position_ids), None
+
+
+def _locate_model_preprocess(model_chunks: list[Any]) -> tuple[Any, bool]:
     for chunk in model_chunks:
         module: Any = chunk
         while hasattr(module, "module"):
             module = module.module
         if isinstance(module, GPTModel):
-            return module
+            return module._preprocess, module.position_embedding_type == "rope"
+        if isinstance(module, MambaModel):
+            return partial(_mamba_preprocess, module), False
         language_model = getattr(module, "language_model", None)
         if isinstance(language_model, GPTModel):
-            return language_model
-    raise RuntimeError("Failed to locate GPTModel for packing invariance validation")
+            return (
+                language_model._preprocess,
+                language_model.position_embedding_type == "rope",
+            )
+    raise RuntimeError("Failed to locate a model preprocessor for packing invariance")
 
 
 class PackingInvarianceScenario(BaseModel):
@@ -393,25 +410,24 @@ def _run_logits(
     position_ids: torch.Tensor,
     attention_bias: Any,
 ) -> torch.Tensor:
-    forward_kwargs = handler.get_forward_kwargs(
-        model,
-        attention_bias=attention_bias,
+    forward_kwargs = dict(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=torch.zeros(
+            (1, 1, 1, 1),
+            dtype=torch.bool,
+            device=input_ids.device,
+        ),
+        labels=None,
+    )
+    forward_kwargs.update(
+        handler.get_forward_kwargs(
+            model,
+            attention_bias=attention_bias,
+        )
     )
     with torch.no_grad():
-        return cast(
-            torch.Tensor,
-            model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=torch.zeros(
-                    (1, 1, 1, 1),
-                    dtype=torch.bool,
-                    device=input_ids.device,
-                ),
-                labels=None,
-                **forward_kwargs,
-            ),
-        )
+        return cast(torch.Tensor, model(**forward_kwargs))
 
 
 def _logits_equivalence_check(
@@ -759,10 +775,9 @@ def _run_packing_invariance_worker(
         if runtime is None:
             raise RuntimeError("packing invariance did not acquire a Megatron runtime")
         model_chunks = cast(list[Any], runtime.model)
-        gpt_module = _locate_gpt_module(model_chunks)
+        hooked_preprocess, rotary_expected = _locate_model_preprocess(model_chunks)
         for chunk in model_chunks:
             chunk.eval()
-        hooked_preprocess = gpt_module._preprocess
 
         for scenario_name, packed_config, deep in scenarios:
             _debug_log(
@@ -780,7 +795,7 @@ def _run_packing_invariance_worker(
             input_ids = cast(torch.Tensor, packed_tensors["tokens"]).cuda()
             group_ids = cast(torch.Tensor, packed_tensors["group_ids"]).cuda()
             parent_ids = cast(torch.Tensor, packed_tensors["parent_ids"]).cuda()
-            rotary_grouping_checked = False
+            rotary_grouping_checked = not rotary_expected
             rotary_grouping_respected = True
             repeated_position_key_count = 0
             for row_index in range(int(position_ids.shape[0])):

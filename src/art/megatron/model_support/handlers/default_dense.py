@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable, Literal, Sequence
 
 import torch
@@ -45,12 +45,16 @@ def _compile_workaround_flags_for_provider(
 class DefaultDenseHandler:
     key = "default_dense"
     build_gdn_execution_spec = False
+    has_recurrent_layers = False
     is_moe = False
     cp_supported = True
     native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config
+
+    def identity_lora_model_context(self) -> AbstractContextManager[None]:
+        return nullcontext()
 
     def identity_lora_target_parameters(
         self,
@@ -132,6 +136,12 @@ class DefaultDenseHandler:
         del model_chunks
         return None
 
+    def prepare_model_for_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
     def build_pipeline_microbatch_activator(
         self,
         model_chunks: Sequence[Any],
@@ -178,6 +188,12 @@ class DefaultDenseHandler:
     def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any] | None:
         del oracle_harness
         return None
+
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]:
+        return oracle_harness.selected_suite_topologies(
+            is_moe=self.is_moe,
+            cp_supported=self.cp_supported,
+        )
 
     def to_vllm_lora_tensors(
         self,
