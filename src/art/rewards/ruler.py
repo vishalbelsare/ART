@@ -48,6 +48,9 @@ DEFAULT_RUBRIC = dedent(
 """Default rubric used by RULER. This generic rubric works well for most tasks,
 as RULER extracts task understanding from the system prompts in the trajectories."""
 
+# A malformed relative ranking is usually transient; permit one bounded re-judge.
+_STRUCTURAL_ATTEMPTS = 2
+
 
 def _judge_provider(judge_model: str) -> str | None:
     provider, separator, _ = judge_model.partition("/")
@@ -217,50 +220,68 @@ async def ruler(
         {"role": "user", "content": user_text},
     ]
 
-    response = await acompletion(
-        model=judge_model,
-        messages=messages,
-        response_format=Response,
-        caching=False,
-        **extra_litellm_params if extra_litellm_params else {},
-    )
-    assert isinstance(response, ModelResponse)
-    _record_ruler_cost(judge_model, response)
+    for attempt in range(_STRUCTURAL_ATTEMPTS):
+        response = await acompletion(
+            model=judge_model,
+            messages=messages,
+            response_format=Response,
+            caching=False,
+            **extra_litellm_params if extra_litellm_params else {},
+        )
+        assert isinstance(response, ModelResponse)
+        _record_ruler_cost(judge_model, response)
 
-    if len(response.choices) == 0:
-        raise ValueError(f"No choices in response: {response}")
-    first_choice = response.choices[0]
+        if len(response.choices) == 0:
+            raise ValueError(f"No choices in response: {response}")
+        first_choice = response.choices[0]
 
-    if debug:
-        raw_content = first_choice.message.content or "{}"
-        try:
-            print("\n[RULER] Pretty-printed LLM choice JSON:")
-            print(json.loads(raw_content))
-        except json.JSONDecodeError as e:
-            print(f"[RULER] Could not parse choice content as JSON: {e}")
-            print(f"[RULER] Raw choice content: {raw_content}")
+        if debug:
+            raw_content = first_choice.message.content or "{}"
+            try:
+                print("\n[RULER] Pretty-printed LLM choice JSON:")
+                print(json.loads(raw_content))
+            except json.JSONDecodeError as e:
+                print(f"[RULER] Could not parse choice content as JSON: {e}")
+                print(f"[RULER] Raw choice content: {raw_content}")
 
-    content = first_choice.message.content or "{}"
-    parsed = Response.model_validate_json(content)
-
-    # If all trajectories were identical, we only sent one to the judge
-    # Duplicate the score for all trajectories
-    if all_identical:
-        if len(parsed.scores) != 1:
-            raise ValueError(
-                f"Expected 1 score for identical trajectories, but got {len(parsed.scores)}"
+        content = first_choice.message.content or "{}"
+        parsed = Response.model_validate_json(content)
+        expected_scores = 1 if all_identical else len(message_lists)
+        structure_error: ValueError | None = None
+        if len(parsed.scores) != expected_scores:
+            qualifier = " for identical trajectories" if all_identical else ""
+            structure_error = ValueError(
+                f"Expected {expected_scores} score{'' if expected_scores == 1 else 's'}"
+                f"{qualifier}, but got {len(parsed.scores)}"
             )
-        single_score = parsed.scores[0]
-        return [
-            single_score.model_copy(update={"trajectory_id": str(i)})
-            for i in range(1, len(message_lists) + 1)
-        ]
-    else:
-        if len(parsed.scores) != len(message_lists):
-            raise ValueError(
-                f"Expected {len(message_lists)} scores, but got {len(parsed.scores)}"
+        expected_ids = [str(index) for index in range(1, expected_scores + 1)]
+        scores_by_id = {score.trajectory_id: score for score in parsed.scores}
+        if structure_error is None and (
+            len(scores_by_id) != expected_scores
+            or set(scores_by_id) != set(expected_ids)
+        ):
+            structure_error = ValueError(
+                f"Expected trajectory ids {expected_ids}, but got "
+                f"{[score.trajectory_id for score in parsed.scores]}"
             )
-        return parsed.scores
+        if structure_error is not None:
+            if attempt + 1 < _STRUCTURAL_ATTEMPTS:
+                continue
+            raise structure_error
+
+        ordered_scores = [scores_by_id[trajectory_id] for trajectory_id in expected_ids]
+
+        # If all trajectories were identical, we only sent one to the judge.
+        # Duplicate the score for all trajectories.
+        if all_identical:
+            single_score = ordered_scores[0]
+            return [
+                single_score.model_copy(update={"trajectory_id": str(i)})
+                for i in range(1, len(message_lists) + 1)
+            ]
+        return ordered_scores
+
+    raise AssertionError("RULER structural retry loop did not return")
 
 
 async def ruler_score_group(
