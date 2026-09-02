@@ -26,6 +26,7 @@ TopKT = TypeVar("TopKT", bound=TopK | None, covariant=True)
 LogitsT = TypeVar("LogitsT", bound=torch.Tensor | None, covariant=True)
 HiddenStatesT = TypeVar("HiddenStatesT", bound=torch.Tensor | None, covariant=True)
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
+TrainerRankPartialExecutionError = _impl.TrainerRankPartialExecutionError
 TrainerRankRuntimeSupportError = _impl.TrainerRankRuntimeSupportError
 TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
 Unset = _impl.Unset
@@ -46,6 +47,7 @@ for _public_type in (
     MicroBatchStats,
     TopK,
     TrainerRankMemoryError,
+    TrainerRankPartialExecutionError,
     TrainerRankRuntimeSupportError,
     TrainerRankSlotStateError,
     MaterializedCheckpoint,
@@ -366,6 +368,7 @@ __all__ = [
     "TopK",
     "TrainerRank",
     "TrainerRankMemoryError",
+    "TrainerRankPartialExecutionError",
     "TrainerRankRuntimeSupportError",
     "PushedCheckpoint",
     "TrainerRankSlotStateError",
