@@ -34,8 +34,9 @@ document records the verified facts the acceptance suite pins).
    decisions; `dp_rank_forward` plans once and raises
    `TrainerRankMemoryError(predicted_peak_bytes, usable_limit_bytes,
    suggestion)` when the unsplit plan cannot be admitted (best-effort internal
-   splitting is a follow-up PR); `TrainerRankRuntimeSupportError` at
-   TP>1/PP>1 (follow-up widens the seam).
+   splitting is a follow-up PR); `TrainerRankRuntimeSupportError` at PP>1
+   (TP>1 was refused at landing as a calibration caution and is admitted
+   again by the TP-support follow-up; see "Tensor parallelism" below).
 4. **Distributed identity WITHOUT a leader protocol** (deliberate deviation
    from the research design, in the spirit of "or whatever's simplest"):
    layout selection is a pure deterministic function of (content identity,
@@ -251,8 +252,68 @@ within the bounded-search contract); and a cold oversized `no_grad` call
 still refuses until a compatible profile exists (a later simplification could
 model `no_grad` retained memory directly from the known output bytes).
 
+## Tensor parallelism (follow-up PR)
+
+TrainerRank accepted TP>1 before the planner landed; #826 refused it as a
+calibration caution, not because anything was missing. The machinery is
+unchanged and pre-dates the planner: the vocab-parallel output head (log-Z,
+target logprobs, top-k and full logits reduced/gathered across the sharded
+vocabulary in the same head chunks), the sequence-parallel hidden gather and
+output-layer SP toggle, TP padding of packed batches (appended singleton tree
+nodes, after planning, so padding can never become a shared subtree), sharded
+vs replicated LoRA gradient reduction, memory checks all-reduced within the
+TP×CP group, and memory-profile signatures keyed by (dp, tp, cp, pp) so a TP
+topology calibrates itself online.
+
+Known, accepted limitations: the cost model carries CP terms but no TP terms
+(layout ranking is expected to survive since sharing shrinks tokens uniformly,
+but constants are uncalibrated — folded into the cost-model recalibration
+follow-up, to be fitted from fresh TP2 telemetry rather than by dividing the
+estimate by TP, which would turn conservative refusals into unsafe
+admissions); the cold static estimate ignores sharding (conservative); the
+all-shards-`-inf` output-head case is a documented non-goal (unreachable for
+supported models without a vocabulary-wide mask). Padding is accounted for:
+execution pads every checkpoint/no-grad group independently to a TP multiple,
+so a plan's `packed_tokens` (and the cheap bounds, the split lower bound and
+the memory profile with it) is the *physical* count, each group rounded up
+(`_physical_tokens`); the unpadded aggregate would have been short by up to
+`groups × (TP−1)` tokens, not merely `< TP`.
+
+Gates (test-first; all failed on the refusing tree):
+- `tests/unit/test_trainer_rank_topology.py`: TP>1 constructs, PP>1 and
+  multi-chunk runtimes still refuse.
+- `--phase tp2-public` (2× H200, Qwen3.5-4B full model, DP1×TP2×CP1, public
+  `dp_rank_forward`, active LoRA slot), plus the identical cell at `--tp 1`
+  as the control: both TP peers plan the same physical layout on every call;
+  the automatic planner shares more deeply than depth-one on the hierarchical
+  GRPO shape; odd packed lengths exercise sequence-parallel padding with
+  outputs at the final real token; losses finite; measured rows compile-free
+  and plan-cache-stable; paired timing reported, not gated. Numerics are
+  gated by `--phase tp-compare` (CPU) on the two dumps. bf16 rounding differs
+  whenever the reduction order changes — a different packing and a different
+  TP degree both change it — and over 36 layers that noise is ~1.3% of the
+  mean logprob magnitude (0.19–0.20 nats per target token) on this cell, so
+  absolute tolerances borrowed from same-packing comparisons cannot separate
+  a TP defect from noise. The reference is therefore the control's own
+  cross-layout divergence measured in the same run: same-layout TP-vs-TP1
+  divergence (mean and max) and cross-layout divergence at TP (outputs and
+  LoRA gradients) must stay within 1.5× of it, losses must agree, and the
+  differences must be unstructured (no request outlier, final tokens like
+  the body, no bias). Measured: same-layout TP2-vs-TP1 1.39% vs the 1.31%
+  reference (ratio 1.06), cross-layout ratios 1.05 (outputs) and 1.06
+  (gradients), losses within 0.06%, flat per-request profile, tail = body.
+- `--phase dp2-tp2-waves` (4× H200, DP2×TP2, public `forward_micro_batches`):
+  at least two waves under the test-only cap, DP replicas with different
+  payloads, identical wave shapes within each TP pair, every input returned
+  exactly once in order, forward and backward per wave, automatic vs
+  depth-one parity, and an empty-DP-slot arm; completing is the no-hang gate.
+- CI: `dev/trainer_rank_check.py` at TP=2 (16 request combinations, two
+  slots) next to the CP=2 run; the GDN TP2 kernel parity test now also runs
+  with LoRA.
+
 ## Explicitly out of scope (follow-ups)
 
-Head chunking and memory margins as data-dependent planner decisions; TP>1 admission seam; cost-model
-recalibration. Not planned: infeasibility proofs, all-rank planning/digest
-agreement, HybridEP/CUDA instrumentation from the research diff.
+Head chunking and memory margins as data-dependent planner decisions;
+cost-model recalibration (including TP terms). Not planned: infeasibility
+proofs, all-rank planning/digest agreement, HybridEP/CUDA instrumentation from
+the research diff.

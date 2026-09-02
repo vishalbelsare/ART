@@ -54,6 +54,7 @@ import argparse
 import functools
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
 import statistics
@@ -911,12 +912,994 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
             dist.destroy_process_group()
 
 
+# --- Tensor-parallel gates ---------------------------------------------------
+#
+# Written before lifting the TP>1 constructor refusal (test-first): both GPU
+# phases below fail on the pre-lift tree at ``TrainerRank(runtime)``.
+#
+# ``tp2-public`` (2 ranks, DP1 x TP2 x CP1) is the first public-API execution
+# of the automatic planner under tensor parallelism: planner-selected prefix
+# sharing -> GDN prefix state -> sequence parallelism -> TP output head ->
+# backward through an active LoRA slot, compared against the depth-one arm.
+# ``dp2-tp2-waves`` (4 ranks, DP2 x TP2) exercises the global wave planner's
+# collectives (world scope) composed with TP execution collectives (pair scope)
+# through public ``forward_micro_batches``, including an empty DP slot.
+
+TP_GATES: dict[str, float] = {
+    # bf16 kernels reorder reductions across packings (same metric/tolerance as
+    # the split-conversion gate and dev/trainer_rank_check.py).
+    "max_output_mean_abs_pct": 0.5,
+    "max_output_abs": 1.0,
+    "max_loss_rel_pct": 0.5,
+    # LoRA gradients across two different packings of the same tokens.
+    "max_grad_rel_l2": 2e-2,
+    "min_grad_cosine": 0.999,
+    # Plan-cache-stable measured rows: identical content plans as a cache hit.
+    "max_measured_planning_ms": 10.0,
+    # Cross-layout divergence at TP may not exceed this multiple of the TP1
+    # control's divergence (and is ignored below an absolute floor).
+    "max_cross_layout_ratio": 1.5,
+}
+# Cross-layout divergence below these absolute floors is never gated.
+TP_CROSS_LAYOUT_FLOOR: dict[str, float] = {"mean_abs_pct": 0.05, "grad_rel_l2": 0.005}
+
+# Hierarchical GRPO shape for the TP2 public cell: (groups, group size, system,
+# prompt, completion). The odd system and completion lengths make every
+# planner layout's packed length odd, so sequence-parallel padding
+# (local_length % TP != 0) is exercised with outputs at the final real token.
+GRPO_TP2 = (2, 8, 1023, 2048, 255)
+
+
+class _ForwardCompileWatch(logging.Handler):
+    """Collect per-forward compile status from the trainer telemetry log."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.statuses: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        marker = "ART_TRAINER_EVENT "
+        if marker not in message:
+            return
+        try:
+            event = json.loads(message.split(marker, 1)[1])
+        except json.JSONDecodeError:
+            return
+        if event.get("event") == "phase" and event.get("phase") == "forward":
+            self.statuses.append(str(event.get("compile_status", "unknown")))
+
+    def take(self) -> list[str]:
+        statuses, self.statuses = self.statuses, []
+        return statuses
+
+
+def _source_fingerprint() -> str:
+    """Content hash of the TrainerRank sources (what decides numerics).
+
+    Content-based rather than a git commit so that a SkyPilot workdir (synced
+    without ``.git``) and a local checkout of the same files agree, and so that
+    uncommitted edits change the fingerprint. The driver itself is hashed
+    separately and recorded for information only: its gate logic does not
+    change what the cell computes.
+    """
+
+    return _content_hash(
+        sorted((REPO_ROOT / "src" / "art" / "trainer_rank").glob("*.py"))
+    )
+
+
+def _driver_fingerprint() -> str:
+    return _content_hash([Path(__file__).resolve()])
+
+
+def _content_hash(files: list[Path]) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _workload_fingerprint(requests: list[Any]) -> dict[str, object]:
+    import hashlib
+
+    digest = hashlib.sha256()
+    for request in requests:
+        digest.update(request.input_tokens.reshape(-1).to("cpu").numpy().tobytes())
+        if request.target_tokens is not None:
+            digest.update(request.target_tokens.reshape(-1).to("cpu").numpy().tobytes())
+    return {
+        "shape": list(GRPO_TP2),
+        "seed": 6_301,
+        "requests_sha256": digest.hexdigest(),
+        "request_count": len(requests),
+    }
+
+
+def _install_compile_watch() -> _ForwardCompileWatch:
+    logger = logging.getLogger("art.trainer_rank._telemetry")
+    logger.setLevel(logging.INFO)
+    watch = _ForwardCompileWatch()
+    logger.addHandler(watch)
+    return watch
+
+
+def _grpo_groups(seed: int, shape: tuple[int, int, int, int, int]) -> list[list[Any]]:
+    """Hierarchical GRPO groups: one nested item per prompt group."""
+
+    import torch
+
+    from art.trainer_rank import ForwardInput
+
+    prompt_groups, group_size, system_tokens, prompt_tokens, completion_tokens = shape
+
+    def _tokens(token_seed: int, count: int) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(token_seed)
+        return torch.randint(low=10, high=64_000, size=(count,), generator=generator)
+
+    system = _tokens(seed * 100_003, system_tokens)
+    groups: list[list[Any]] = []
+    for prompt_group in range(prompt_groups):
+        prompt = _tokens(seed * 1_000_003 + prompt_group * 100_019, prompt_tokens)
+        prefix = torch.cat((system, prompt))
+        requests: list[Any] = []
+        for branch in range(group_size):
+            completion = _tokens(
+                seed * 10_000_019 + prompt_group * 1_000_033 + branch * 10_007,
+                completion_tokens,
+            )
+            tokens = torch.cat((prefix, completion))
+            labels = torch.roll(tokens, shifts=-1).clone()
+            labels[-1] = -100
+            labels[: max(int(prefix.numel()) - 1, 0)] = -100
+            requests.append(ForwardInput(input_tokens=tokens, target_tokens=labels))
+        groups.append(requests)
+    return groups
+
+
+def _anchor_env(arm: str) -> None:
+    if arm == "automatic":
+        os.environ.pop(TEST_ANCHOR_ENV, None)
+        os.environ.pop(TEST_HOOKS_ENV, None)
+    else:
+        os.environ[TEST_HOOKS_ENV] = "1"
+        os.environ[TEST_ANCHOR_ENV] = arm
+
+
+def _tp_group() -> Any:
+    from megatron.core import parallel_state as ps
+
+    return ps.get_tensor_model_parallel_group(check_initialized=False)
+
+
+def _gather_objects(value: Any, group: Any = None) -> list[Any]:
+    import torch.distributed as dist
+
+    size = dist.get_world_size(group)
+    values: list[Any] = [None] * size
+    dist.all_gather_object(values, value, group=group)
+    return values
+
+
+def _plan_fingerprint(
+    rank: Any, requests: list[Any], checkpoint: Any
+) -> dict[str, Any]:
+    """Content fingerprint of the plan this rank would execute (a cache hit)."""
+
+    import hashlib
+
+    plan = rank._plan_flat_forward(requests, checkpoint=checkpoint)
+    telemetry = rank.last_forward_telemetry()
+    return {
+        # Physical count (each group padded to the TP multiple) and the
+        # unpadded per-group lengths that execution pads.
+        "packed_tokens": int(plan.packed_tokens),
+        "group_lengths": [int(group.packed.tokens.numel()) for group in plan.groups],
+        "logical_tokens": int(plan.logical_tokens),
+        "selected_max_depth": int(plan.selected_max_depth),
+        "subforward_request_indices": telemetry["subforward_request_indices"],
+        "groups": [
+            {
+                "tokens": hashlib.sha256(
+                    group.packed.tokens.cpu().contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "group_ids": hashlib.sha256(
+                    group.packed.group_ids.cpu().contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "segments": len(group.packed.segments),
+            }
+            for group in plan.groups
+        ],
+    }
+
+
+def _assert_tp_peers_agree(fingerprint: dict[str, object], label: str) -> None:
+    peers = _gather_objects(fingerprint, _tp_group())
+    if any(peer != peers[0] for peer in peers):
+        _fail(f"{label}: TP peers planned different physical layouts: {peers}")
+
+
+def _lora_gradients(rank: Any, slot: str) -> list[Any]:
+    import torch
+
+    return [
+        torch.zeros_like(parameter, dtype=torch.float32, device="cpu")
+        if parameter.grad is None
+        else parameter.grad.detach().float().cpu().clone()
+        for parameter in rank._checkpoint_slots[slot].params
+    ]
+
+
+def _compare_gradients(actual: list[Any], expected: list[Any]) -> tuple[float, float]:
+    """Return (relative L2 error, cosine similarity) over all LoRA gradients."""
+
+    import torch
+
+    flat_actual = torch.cat([g.reshape(-1).double() for g in actual])
+    flat_expected = torch.cat([g.reshape(-1).double() for g in expected])
+    denominator = max(float(flat_expected.norm()), 1e-300)
+    rel_l2 = float((flat_actual - flat_expected).norm()) / denominator
+    cosine = float(
+        (flat_actual @ flat_expected)
+        / max(float(flat_actual.norm()) * float(flat_expected.norm()), 1e-300)
+    )
+    return rel_l2, cosine
+
+
+def _compare_logprobs(actual: list[Any], expected: list[Any]) -> tuple[float, float]:
+    import torch
+
+    flat_actual = torch.cat([a.reshape(-1) for a in actual])
+    flat_expected = torch.cat([b.reshape(-1) for b in expected])
+    mean_abs_pct = float(
+        (flat_actual - flat_expected).abs().mean()
+        / max(float(flat_expected.abs().mean()), 1e-6)
+        * 100.0
+    )
+    return mean_abs_pct, float((flat_actual - flat_expected).abs().max())
+
+
+def _check_pair(
+    rows: list[dict[str, object]],
+    label: str,
+    automatic: dict[str, Any],
+    depth_one: dict[str, Any],
+) -> None:
+    """Gate automatic-vs-depth-one outputs, loss and LoRA gradients."""
+
+    mean_abs_pct, max_abs = _compare_logprobs(
+        automatic["logprobs"], depth_one["logprobs"]
+    )
+    loss_rel_pct = (
+        abs(automatic["loss"] - depth_one["loss"])
+        / max(abs(depth_one["loss"]), 1e-6)
+        * 100.0
+    )
+    grad_rel_l2, grad_cosine = _compare_gradients(
+        automatic["gradients"], depth_one["gradients"]
+    )
+    rows.append(
+        {
+            "arm": f"{label}-parity",
+            "mean_abs_pct": mean_abs_pct,
+            "max_abs": max_abs,
+            "loss_rel_pct": loss_rel_pct,
+            "grad_rel_l2": grad_rel_l2,
+            "grad_cosine": grad_cosine,
+        }
+    )
+    problems = []
+    if mean_abs_pct > TP_GATES["max_output_mean_abs_pct"]:
+        problems.append(f"output mean_abs_pct={mean_abs_pct:.4f}")
+    if max_abs > TP_GATES["max_output_abs"]:
+        problems.append(f"output max_abs={max_abs:.4f}")
+    if loss_rel_pct > TP_GATES["max_loss_rel_pct"]:
+        problems.append(f"loss_rel_pct={loss_rel_pct:.4f}")
+    if grad_rel_l2 > TP_GATES["max_grad_rel_l2"]:
+        problems.append(f"grad_rel_l2={grad_rel_l2:.5f}")
+    if grad_cosine < TP_GATES["min_grad_cosine"]:
+        problems.append(f"grad_cosine={grad_cosine:.6f}")
+    if problems:
+        _fail(f"{label}: automatic vs depth-one diverge: " + ", ".join(problems))
+
+
+def _init_gpu_phase(name: str) -> None:
+    import torch
+    import torch.distributed as dist
+
+    if not torch.cuda.is_available():
+        _fail(f"{name} phase requires CUDA")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group(backend="nccl")
+
+
+def _require_topology(rank: Any, *, tp: int, dp: int) -> None:
+    from megatron.core import parallel_state as ps
+
+    actual_tp = int(ps.get_tensor_model_parallel_world_size())
+    actual_dp = int(ps.get_data_parallel_world_size())
+    if (actual_tp, actual_dp) != (tp, dp):
+        _fail(
+            f"expected TP{tp} x DP{dp}, runtime initialized TP{actual_tp} x DP{actual_dp}"
+        )
+
+
+def _write_rows(evidence: str | None, rows: list[dict[str, object]], name: str) -> None:
+    import torch.distributed as dist
+
+    if evidence and dist.get_rank() == 0:
+        with open(evidence, "a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+    if dist.get_rank() == 0:
+        print(f"{name} phase: PASS {rows}")
+
+
+def phase_tp2_public(
+    evidence: str | None, repeat: int, *, tp: int, dump_dir: str | None
+) -> None:
+    """DP1 x TP{tp} x CP1 public ``dp_rank_forward`` cell (Qwen3.5-4B full model).
+
+    Run at ``--tp 2`` (the gate) and at ``--tp 1`` (the control: the identical
+    cell on one GPU). Structural gates run here; the numerics gates compare
+    the two dumps in ``--phase tp-compare`` (CPU), because bf16 divergence
+    between two packings of the same tokens is only meaningful relative to
+    the TP1 control, and TP correctness itself is a same-layout question.
+
+    Gates:
+    - all TP peers plan the same physical layout on every call;
+    - the automatic planner shares more deeply than depth-one on the
+      hierarchical GRPO shape (fewer packed tokens);
+    - materialized group lengths are not TP multiples, so sequence-parallel
+      padding is exercised at TP>1 with outputs at the final real token (the
+      reported ``packed_tokens`` is the physical, padded count);
+    - the loss is finite for both arms;
+    - measured rows are compile-free and plan-cache-stable (3 warmups per arm,
+      then ``repeat`` alternating measured pairs); paired timing is reported.
+    Rows are printed as they are produced and written even on failure.
+    """
+
+    phase_contract()
+    _init_gpu_phase("tp2-public")
+    import math
+    import statistics
+
+    import torch
+    import torch.distributed as dist
+
+    from art.megatron import train as megatron_train
+    from art.trainer_rank import TrainerRank
+
+    sys.path.insert(0, str(REPO_ROOT / "dev"))
+    from trainer_rank_support import load_random_checkpoints
+
+    label = f"tp{tp}-public"
+    rows: list[dict[str, object]] = []
+
+    def note(row: dict[str, object]) -> None:
+        rows.append(row)
+        if dist.get_rank() == 0:
+            print(
+                f"{label} row: {json.dumps(row, sort_keys=True, default=str)}",
+                flush=True,
+            )
+
+    try:
+        torch.manual_seed(1234)
+        runtime = megatron_train.build_training_runtime(
+            model_identifier="Qwen/Qwen3.5-4B",
+            print_env=dist.get_rank() == 0,
+        )
+        for chunk in runtime.model:
+            chunk.train()
+        rank = TrainerRank(runtime)
+        _require_topology(rank, tp=tp, dp=1)
+        [slot] = load_random_checkpoints(runtime, rank, 1, base_model="Qwen/Qwen3.5-4B")
+        watch = _install_compile_watch()
+        requests = [
+            request for group in _grpo_groups(6_301, GRPO_TP2) for request in group
+        ]
+
+        def run(arm: str) -> dict[str, Any]:
+            _anchor_env(arm)
+            watch.take()
+            rank.zero_grad()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            outputs = rank.dp_rank_forward(requests, checkpoint=slot)
+            loss = _output_loss(outputs)
+            loss.backward()
+            end.record()
+            torch.cuda.synchronize()
+            telemetry = rank.last_forward_telemetry()
+            fingerprint = _plan_fingerprint(rank, requests, slot)
+            _assert_tp_peers_agree(fingerprint, f"{label} {arm}")
+            result = {
+                "arm": arm,
+                "ms": float(start.elapsed_time(end)),
+                "loss": float(loss.detach().float().item()),
+                "logprobs": [o.target_logprobs.detach().float().cpu() for o in outputs],
+                "gradients": _lora_gradients(rank, slot),
+                "selected_max_depth": int(telemetry["selected_max_depth"]),
+                "planning_ms": float(telemetry["planning_ms"]),
+                "packed_tokens": int(fingerprint["packed_tokens"]),
+                "group_lengths": list(fingerprint["group_lengths"]),
+                "compile_statuses": watch.take(),
+            }
+            del outputs, loss
+            rank.zero_grad()
+            _anchor_env("automatic")
+            return result
+
+        # Warmups (compile, autotune, memory profile) for both arms.
+        for _ in range(3):
+            for arm in ("automatic", "depth_one"):
+                run(arm)
+        # Correctness runs: both arms, plus a repeat of automatic for the
+        # same-layout run-to-run noise floor (bf16 backward is nondeterministic).
+        automatic = run("automatic")
+        depth_one = run("depth_one")
+        automatic_again = run("automatic")
+        noise_out = _compare_logprobs(
+            automatic_again["logprobs"], automatic["logprobs"]
+        )
+        noise_grad = _compare_gradients(
+            automatic_again["gradients"], automatic["gradients"]
+        )
+        note(
+            {
+                "arm": f"{label}-layouts",
+                "tp": tp,
+                "automatic_selected_max_depth": automatic["selected_max_depth"],
+                "automatic_packed_tokens": automatic["packed_tokens"],
+                "automatic_group_lengths": automatic["group_lengths"],
+                "depth_one_selected_max_depth": depth_one["selected_max_depth"],
+                "depth_one_packed_tokens": depth_one["packed_tokens"],
+                "depth_one_group_lengths": depth_one["group_lengths"],
+                "logical_tokens": sum(int(r.input_tokens.numel()) for r in requests),
+                "automatic_loss": automatic["loss"],
+                "depth_one_loss": depth_one["loss"],
+                "same_layout_noise_output_mean_abs_pct": noise_out[0],
+                "same_layout_noise_output_max_abs": noise_out[1],
+                "same_layout_noise_grad_rel_l2": noise_grad[0],
+                "same_layout_noise_grad_cosine": noise_grad[1],
+            }
+        )
+        cross_out = _compare_logprobs(automatic["logprobs"], depth_one["logprobs"])
+        cross_grad = _compare_gradients(automatic["gradients"], depth_one["gradients"])
+        note(
+            {
+                "arm": f"{label}-cross-layout",
+                "tp": tp,
+                "mean_abs_pct": cross_out[0],
+                "max_abs": cross_out[1],
+                "loss_rel_pct": abs(automatic["loss"] - depth_one["loss"])
+                / max(abs(depth_one["loss"]), 1e-6)
+                * 100.0,
+                "grad_rel_l2": cross_grad[0],
+                "grad_cosine": cross_grad[1],
+            }
+        )
+        if automatic["packed_tokens"] >= depth_one["packed_tokens"]:
+            _fail(
+                "automatic planner did not share more deeply than depth-one "
+                f"({automatic['packed_tokens']} vs {depth_one['packed_tokens']} packed tokens)"
+            )
+        # ``packed_tokens`` is the physical (padded) count; padding is
+        # exercised when a materialized group length is not a TP multiple.
+        if tp > 1 and not all(
+            any(length % tp for length in result["group_lengths"])
+            for result in (automatic, depth_one)
+        ):
+            _fail("cell shape did not exercise sequence-parallel padding")
+        if not (math.isfinite(automatic["loss"]) and math.isfinite(depth_one["loss"])):
+            _fail("non-finite loss")
+        if dump_dir and dist.get_rank() == 0:
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "tp": tp,
+                    "source": _source_fingerprint(),
+                    "driver": _driver_fingerprint(),
+                    "workload": _workload_fingerprint(requests),
+                    "arms": {
+                        arm: {
+                            "logprobs": result["logprobs"],
+                            "loss": result["loss"],
+                            "packed_tokens": result["packed_tokens"],
+                            "group_lengths": result["group_lengths"],
+                            "selected_max_depth": result["selected_max_depth"],
+                        }
+                        for arm, result in (
+                            ("automatic", automatic),
+                            ("depth_one", depth_one),
+                        )
+                    },
+                    "noise": {
+                        "output_mean_abs_pct": noise_out[0],
+                        "output_max_abs": noise_out[1],
+                        "grad_rel_l2": noise_grad[0],
+                        "grad_cosine": noise_grad[1],
+                    },
+                    "cross_layout": {
+                        "mean_abs_pct": cross_out[0],
+                        "max_abs": cross_out[1],
+                        "grad_rel_l2": cross_grad[0],
+                        "grad_cosine": cross_grad[1],
+                    },
+                },
+                Path(dump_dir, f"tp{tp}_public.pt"),
+            )
+
+        # Alternating measured pairs: compile-free and plan-cache-stable.
+        samples: dict[str, list[float]] = {"automatic": [], "depth_one": []}
+        for _ in range(repeat):
+            for arm in ("automatic", "depth_one"):
+                result = run(arm)
+                samples[arm].append(result["ms"])
+                if any(status != "none" for status in result["compile_statuses"]):
+                    _fail(f"measured {arm} row compiled: {result['compile_statuses']}")
+                if result["planning_ms"] > TP_GATES["max_measured_planning_ms"]:
+                    _fail(
+                        f"measured {arm} row was not a plan-cache hit: {result['planning_ms']:.2f} ms"
+                    )
+                reference = automatic if arm == "automatic" else depth_one
+                if result["packed_tokens"] != reference["packed_tokens"]:
+                    _fail(f"measured {arm} row changed layout")
+        paired_gain = [
+            (d - a) / d * 100.0
+            for a, d in zip(samples["automatic"], samples["depth_one"], strict=True)
+        ]
+        note(
+            {
+                "arm": f"{label}-timing",
+                "tp": tp,
+                "automatic_median_ms": statistics.median(samples["automatic"]),
+                "depth_one_median_ms": statistics.median(samples["depth_one"]),
+                "paired_median_gain_pct": statistics.median(paired_gain),
+                "measured_pairs": repeat,
+            }
+        )
+        _write_rows(evidence, rows, label)
+    except SystemExit:
+        if evidence and dist.get_rank() == 0:
+            with open(evidence, "a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _difference_profile(actual: list[Any], expected: list[Any]) -> dict[str, float]:
+    """Per-target-token difference statistics (masked positions are exact zeros)."""
+
+    import torch
+
+    per_request: list[float] = []
+    tails: list[float] = []
+    bodies: list[float] = []
+    signed: list[float] = []
+    for a, b in zip(actual, expected, strict=True):
+        a = a.reshape(-1).double()
+        b = b.reshape(-1).double()
+        mask = (a != 0) & (b != 0)
+        d = (a - b)[mask]
+        if int(d.numel()) < 8:
+            continue
+        per_request.append(float(d.abs().mean()))
+        tails.append(float(d[-4:].abs().mean()))
+        bodies.append(float(d[:-4].abs().mean()))
+        signed.append(float(d.mean()))
+    if not per_request:
+        _fail("difference profile: no unmasked target tokens")
+    ordered = sorted(per_request)
+    return {
+        "mean_abs_per_token": sum(per_request) / len(per_request),
+        "max_request_mean_abs": ordered[-1],
+        "median_request_mean_abs": ordered[len(ordered) // 2],
+        "tail_mean_abs": sum(tails) / len(tails),
+        "body_mean_abs": sum(bodies) / len(bodies),
+        "signed_mean": sum(signed) / len(signed),
+    }
+
+
+def phase_tp_compare(
+    control_dump: str, dump: str, evidence: str | None, *, expect_tp: int
+) -> None:
+    """CPU numerics gates for the TP public cell against its TP1 control.
+
+    bf16 rounding differs whenever the reduction order changes, and both a
+    different packing (cross-layout) and a different tensor-parallel degree
+    (sharded GEMMs, bf16 all-reduces) change it. Over 36 layers that noise is
+    about 1.3% of the mean logprob magnitude on this cell, so absolute
+    tolerances borrowed from same-packing comparisons cannot separate a TP
+    defect from noise. The reference is therefore the control's own
+    cross-layout divergence (automatic vs depth-one at TP1), measured on the
+    identical cell in the same run:
+
+    - same-layout TP correctness: for each arm, TP-vs-TP1 output divergence
+      (mean and max) must stay within ``max_cross_layout_ratio`` of the
+      control's cross-layout divergence, and the losses must agree;
+    - cross-layout divergence at TP (outputs and LoRA gradients) must stay
+      within the same ratio of the control's;
+    - no structured error: no request's mean difference exceeds twice the
+      median request's, the last four target tokens (where sequence-parallel
+      padding sits) differ no more than twice the body, and the signed mean
+      difference is small relative to the absolute one.
+    """
+
+    import torch
+
+    control = torch.load(control_dump, weights_only=False)
+    trial = torch.load(dump, weights_only=False)
+    if int(control["tp"]) != 1:
+        _fail(f"control dump must be TP1 (got tp={control['tp']})")
+    if expect_tp <= 1 or int(trial["tp"]) != expect_tp:
+        _fail(
+            f"trial dump must come from the TP{expect_tp} cell (got tp={trial['tp']}); "
+            "a TP1 dump supplied as the trial would pass every comparison trivially"
+        )
+    for key in ("source", "workload"):
+        if not control.get(key) or control.get(key) != trial.get(key):
+            _fail(
+                f"control and trial dumps must carry the same {key} fingerprint: "
+                f"{control.get(key)!r} vs {trial.get(key)!r}"
+            )
+    ratio = TP_GATES["max_cross_layout_ratio"]
+    rows: list[dict[str, object]] = []
+    problems: list[str] = []
+    reference_mean = float(control["cross_layout"]["mean_abs_pct"])
+    reference_max = float(control["cross_layout"]["max_abs"])
+    reference_profile = _difference_profile(
+        control["arms"]["automatic"]["logprobs"],
+        control["arms"]["depth_one"]["logprobs"],
+    )
+    rows.append(
+        {
+            "arm": "tp1-cross-layout-reference",
+            "source": control.get("source"),
+            "driver": {"control": control.get("driver"), "trial": trial.get("driver")},
+            "workload": control.get("workload"),
+            "trial_tp": trial["tp"],
+            **control["cross_layout"],
+            **reference_profile,
+        }
+    )
+
+    def structured(label: str, profile: dict[str, float]) -> None:
+        if profile["max_request_mean_abs"] > 2.0 * profile["median_request_mean_abs"]:
+            problems.append(
+                f"{label}: one request diverges ({profile['max_request_mean_abs']:.3f} vs "
+                f"median {profile['median_request_mean_abs']:.3f})"
+            )
+        if profile["tail_mean_abs"] > 2.0 * max(profile["body_mean_abs"], 1e-9):
+            problems.append(
+                f"{label}: final tokens diverge ({profile['tail_mean_abs']:.3f} vs body "
+                f"{profile['body_mean_abs']:.3f})"
+            )
+        if abs(profile["signed_mean"]) > 0.25 * profile["mean_abs_per_token"]:
+            problems.append(
+                f"{label}: biased differences (signed {profile['signed_mean']:+.4f} vs "
+                f"abs {profile['mean_abs_per_token']:.4f})"
+            )
+
+    for arm in ("automatic", "depth_one"):
+        c, tr = control["arms"][arm], trial["arms"][arm]
+        # Same layout means the same materialized (unpadded) group lengths;
+        # ``packed_tokens`` is physical and differs by the TP padding.
+        if c["group_lengths"] != tr["group_lengths"]:
+            problems.append(
+                f"{arm}: TP{trial['tp']} group lengths {tr['group_lengths']} vs TP1 "
+                f"{c['group_lengths']} (layouts differ)"
+            )
+            continue
+        mean_abs_pct, max_abs = _compare_logprobs(tr["logprobs"], c["logprobs"])
+        loss_rel_pct = abs(tr["loss"] - c["loss"]) / max(abs(c["loss"]), 1e-6) * 100.0
+        profile = _difference_profile(tr["logprobs"], c["logprobs"])
+        rows.append(
+            {
+                "arm": f"tp{trial['tp']}-vs-tp1-{arm}",
+                "group_lengths": tr["group_lengths"],
+                "packed_tokens_tp": tr["packed_tokens"],
+                "packed_tokens_tp1": c["packed_tokens"],
+                "mean_abs_pct": mean_abs_pct,
+                "max_abs": max_abs,
+                "loss_rel_pct": loss_rel_pct,
+                "mean_abs_pct_ratio_to_reference": mean_abs_pct
+                / max(reference_mean, 1e-12),
+                **profile,
+            }
+        )
+        if mean_abs_pct > ratio * reference_mean:
+            problems.append(
+                f"{arm}: same-layout output divergence {mean_abs_pct:.4f}% exceeds "
+                f"{ratio}x the TP1 cross-layout reference {reference_mean:.4f}%"
+            )
+        if max_abs > ratio * reference_max:
+            problems.append(
+                f"{arm}: same-layout max_abs {max_abs:.3f} exceeds {ratio}x the reference {reference_max:.3f}"
+            )
+        if loss_rel_pct > TP_GATES["max_loss_rel_pct"]:
+            problems.append(f"{arm}: same-layout loss_rel_pct={loss_rel_pct:.4f}")
+        structured(f"tp{trial['tp']}-vs-tp1-{arm}", profile)
+
+    trial_profile = _difference_profile(
+        trial["arms"]["automatic"]["logprobs"], trial["arms"]["depth_one"]["logprobs"]
+    )
+    cross: dict[str, object] = {
+        "arm": f"tp{trial['tp']}-cross-layout-vs-control",
+        **trial_profile,
+    }
+    for key in ("mean_abs_pct", "grad_rel_l2"):
+        c, tr = float(control["cross_layout"][key]), float(trial["cross_layout"][key])
+        cross[f"{key}_control"] = c
+        cross[f"{key}_trial"] = tr
+        cross[f"{key}_ratio"] = tr / max(c, 1e-12)
+        if tr > ratio * c and tr > TP_CROSS_LAYOUT_FLOOR[key]:
+            problems.append(
+                f"cross-layout {key} at TP{trial['tp']} is {tr:.5f} vs {c:.5f} at TP1 "
+                f"(ratio {tr / max(c, 1e-12):.2f} > {ratio})"
+            )
+    cross["control_noise"] = control["noise"]
+    cross["trial_noise"] = trial["noise"]
+    rows.append(cross)
+    structured(f"tp{trial['tp']}-cross-layout", trial_profile)
+    if evidence:
+        with open(evidence, "a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+    for row in rows:
+        print(json.dumps(row, sort_keys=True, default=str))
+    if problems:
+        _fail("tp-compare:\n  - " + "\n  - ".join(problems))
+    print("tp-compare phase: PASS")
+
+
+def phase_dp2_tp2_waves(evidence: str | None) -> None:
+    """DP2 x TP2 public ``forward_micro_batches`` gate (4 ranks, Qwen3.5-4B).
+
+    Arm A (branchy): six hierarchical GRPO groups as top-level items, the
+    test-only memory cap sized so the stream needs at least two waves, forward
+    and backward per wave through an active LoRA slot. Gates: every global input
+    is returned exactly once in original order; both ranks of each TP pair
+    execute identical wave shapes while DP replicas carry different payloads;
+    the automatic planner selects depth > 1; automatic vs depth-one outputs,
+    loss and LoRA gradients agree; no collective hangs (the run completes).
+
+    Arm B (empty slot): a single heterogeneous item, so one DP replica has
+    nothing to do in the only wave and must still complete the protocol.
+    """
+
+    phase_contract()
+    _init_gpu_phase("dp2-tp2-waves")
+    import torch
+    import torch.distributed as dist
+
+    from art.megatron import train as megatron_train
+    from art.trainer_rank import ForwardInput, TrainerRank
+
+    sys.path.insert(0, str(REPO_ROOT / "dev"))
+    from trainer_rank_support import load_random_checkpoints
+
+    rows: list[dict[str, object]] = []
+    try:
+        torch.manual_seed(1234)
+        runtime = megatron_train.build_training_runtime(
+            model_identifier="Qwen/Qwen3.5-4B",
+            print_env=dist.get_rank() == 0,
+        )
+        for chunk in runtime.model:
+            chunk.train()
+        rank = TrainerRank(runtime)
+        _require_topology(rank, tp=2, dp=2)
+        dp_rank, dp_size = rank._dp_rank_and_size()
+        [slot] = load_random_checkpoints(runtime, rank, 1, base_model="Qwen/Qwen3.5-4B")
+        items = [
+            group
+            for seed in range(6)
+            for group in _grpo_groups(7_001 + seed, (1, 8, 1023, 2048, 255))
+        ]
+
+        def stream(arm: str, cap_bytes: int | None) -> dict[str, Any]:
+            _anchor_env(arm)
+            if cap_bytes is None:
+                os.environ.pop(SPLIT_MEMORY_LIMIT_ENV, None)
+            else:
+                os.environ[TEST_HOOKS_ENV] = "1"
+                os.environ[SPLIT_MEMORY_LIMIT_ENV] = str(cap_bytes)
+            rank.zero_grad()
+            seen: list[int] = []
+            wave_shapes: list[dict[str, object]] = []
+            logprobs: dict[int, list[torch.Tensor]] = {}
+            loss_total = 0.0
+            depths: list[int] = []
+            for batch in rank.forward_micro_batches(items, checkpoint=slot):
+                seen.extend(int(index) for index in batch.indices)
+                telemetry = rank.last_forward_telemetry()
+                depths.append(int(telemetry["selected_max_depth"]))
+                wave_shapes.append(
+                    {
+                        "global_start": batch.stats.global_start,
+                        "global_stop": batch.stats.global_stop,
+                        "global_count": batch.stats.global_count,
+                        "local_count": batch.stats.local_count,
+                        "packed_tokens": batch.stats.packed_tokens,
+                        "logical_tokens": batch.stats.logical_tokens,
+                        "selected_max_depth": int(telemetry["selected_max_depth"]),
+                        "subforward_count": batch.stats.subforward_count,
+                    }
+                )
+                flat = [output for group in batch.outputs for output in group]
+                for index, group in zip(batch.indices, batch.outputs, strict=True):
+                    logprobs[int(index)] = [
+                        o.target_logprobs.detach().float().cpu() for o in group
+                    ]
+                if flat:
+                    loss = _output_loss(flat)
+                    loss_total += float(loss.detach().float().item())
+                    loss.backward()
+            torch.cuda.synchronize()
+            result = {
+                "arm": arm,
+                "seen": seen,
+                "waves": wave_shapes,
+                "loss": loss_total,
+                "logprobs": logprobs,
+                "gradients": _lora_gradients(rank, slot),
+                "depths": depths,
+            }
+            rank.zero_grad()
+            _anchor_env("automatic")
+            os.environ.pop(SPLIT_MEMORY_LIMIT_ENV, None)
+            return result
+
+        # Warm-up: one uncapped automatic stream (compile, profile).
+        stream("automatic", None)
+        # Cap so at most two items fit per DP rank per wave (three waves).
+        plan = rank._plan_flat_forward(items[0], checkpoint=slot)
+        per_item = rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=plan.packed_tokens,
+            output_bytes=plan.output_bytes,
+            signature=plan.signature,
+            logical_tokens=plan.logical_tokens,
+        )
+        torch.cuda.synchronize()
+        cap = int(torch.cuda.memory_allocated()) + int(per_item * 2.5)
+        cap_all = _gather_objects(cap)
+        cap = min(cap_all)  # one cap on every rank; MIN-reduced budgets anyway
+
+        automatic = stream("automatic", cap)
+        depth_one = stream("depth_one", cap)
+
+        # Every global input exactly once, in original order, across DP ranks
+        # (ranks in one TP pair hold the same slice, so dedupe by DP rank).
+        for result in (automatic, depth_one):
+            by_dp: dict[int, list[int]] = {}
+            for peer_dp, seen in _gather_objects((dp_rank, result["seen"])):
+                by_dp.setdefault(int(peer_dp), list(seen))
+            merged = sorted(index for seen in by_dp.values() for index in seen)
+            if merged != list(range(len(items))):
+                _fail(f"{result['arm']}: inputs not returned exactly once: {merged}")
+            if any(seen != sorted(seen) for seen in by_dp.values()):
+                _fail(
+                    f"{result['arm']}: a DP rank returned inputs out of order: {by_dp}"
+                )
+            if len(result["waves"]) < 2:
+                _fail(
+                    f"{result['arm']}: expected at least two waves, got {len(result['waves'])}"
+                )
+            peers = _gather_objects(result["waves"], _tp_group())
+            if any(peer != peers[0] for peer in peers):
+                _fail(
+                    f"{result['arm']}: TP peers executed different wave shapes: {peers}"
+                )
+            if len({tuple(seen) for seen in by_dp.values()}) < len(by_dp):
+                _fail(
+                    "DP replicas received identical payloads; the gate needs distinct slices"
+                )
+        if not all(
+            wave["packed_tokens"] < wave["logical_tokens"]
+            for wave in automatic["waves"]
+        ):
+            _fail(
+                f"automatic planner shared nothing in some wave: {automatic['waves']}"
+            )
+        rows.append(
+            {
+                "arm": "dp2-tp2-branchy",
+                "waves": len(automatic["waves"]),
+                "wave_shapes": automatic["waves"],
+                "depth_one_waves": len(depth_one["waves"]),
+                "local_indices": sorted(automatic["seen"]),
+                "cap_bytes": cap,
+            }
+        )
+        # Parity per item held locally (both arms hold the same local slice).
+        local = sorted(automatic["logprobs"])
+        if local != sorted(depth_one["logprobs"]):
+            _fail("arms held different local item sets")
+        _check_pair(
+            rows,
+            "dp2-tp2-branchy",
+            {
+                **automatic,
+                "logprobs": [
+                    t for index in local for t in automatic["logprobs"][index]
+                ],
+            },
+            {
+                **depth_one,
+                "logprobs": [
+                    t for index in local for t in depth_one["logprobs"][index]
+                ],
+            },
+        )
+
+        # Arm B: empty DP slot.
+        single = [
+            ForwardInput(
+                input_tokens=(
+                    tokens := torch.randint(
+                        10,
+                        64_000,
+                        (1_537,),
+                        generator=torch.Generator().manual_seed(9_301),
+                    )
+                ),
+                target_tokens=torch.cat((tokens[1:], tokens.new_tensor([-100]))),
+            )
+        ]
+        rank.zero_grad()
+        waves = 0
+        local_outputs = 0
+        for batch in rank.forward_micro_batches([single], checkpoint=slot):
+            waves += 1
+            flat = [output for group in batch.outputs for output in group]
+            local_outputs += len(flat)
+            if flat:
+                _output_loss(flat).backward()
+        torch.cuda.synchronize()
+        counts = _gather_objects((dp_rank, waves, local_outputs))
+        rows.append({"arm": "dp2-tp2-empty-slot", "per_rank": counts})
+        per_dp = {}
+        for dp, wave_count, outputs in counts:
+            per_dp.setdefault(dp, set()).add((wave_count, outputs))
+        if any(len(v) != 1 for v in per_dp.values()):
+            _fail(f"TP peers disagree on the empty-slot wave: {counts}")
+        totals = sorted(next(iter(v)) for v in per_dp.values())
+        if totals != [(1, 0), (1, 1)]:
+            _fail(
+                f"empty-slot arm expected one wave with (0, 1) outputs across DP ranks: {counts}"
+            )
+        rank.zero_grad()
+        _write_rows(evidence, rows, "dp2-tp2-waves")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase",
         required=True,
-        choices=("contract", "census", "measure", "validate", "split-conversion"),
+        choices=(
+            "contract",
+            "census",
+            "measure",
+            "validate",
+            "split-conversion",
+            "tp2-public",
+            "dp2-tp2-waves",
+            "tp-compare",
+        ),
     )
     parser.add_argument("--cell", default="grpo-gdn-cp4")
     parser.add_argument(
@@ -930,6 +1913,22 @@ def main() -> None:
         choices=("cap", "ballast"),
         help="split-conversion only: induce memory pressure with the test-only cap or real ballast",
     )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=2,
+        help=(
+            "tp2-public: expected tensor-parallel size (1 runs the control cell); "
+            "tp-compare: required TP of the trial dump"
+        ),
+    )
+    parser.add_argument(
+        "--dump-dir", default="", help="tp2-public only: save per-arm outputs here"
+    )
+    parser.add_argument(
+        "--control-dump", default="", help="tp-compare: TP1 control dump (.pt)"
+    )
+    parser.add_argument("--dump", default="", help="tp-compare: TP>1 dump (.pt)")
     arguments = parser.parse_args()
     if arguments.phase == "contract":
         phase_contract()
@@ -943,6 +1942,24 @@ def main() -> None:
         )
     elif arguments.phase == "split-conversion":
         phase_split_conversion(arguments.evidence or None, arguments.pressure)
+    elif arguments.phase == "tp2-public":
+        phase_tp2_public(
+            arguments.evidence or None,
+            arguments.repeat,
+            tp=arguments.tp,
+            dump_dir=arguments.dump_dir or None,
+        )
+    elif arguments.phase == "tp-compare":
+        if not (arguments.control_dump and arguments.dump):
+            _fail("tp-compare requires --control-dump and --dump")
+        phase_tp_compare(
+            arguments.control_dump,
+            arguments.dump,
+            arguments.evidence or None,
+            expect_tp=arguments.tp,
+        )
+    elif arguments.phase == "dp2-tp2-waves":
+        phase_dp2_tp2_waves(arguments.evidence or None)
     else:
         if not arguments.evidence:
             _fail("--evidence input path is required for validate")

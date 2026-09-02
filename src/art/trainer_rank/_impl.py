@@ -883,6 +883,8 @@ class _FlatForwardPlan:
     request_count: int
     output_metadata: tuple[tuple[str | None, bool], ...]
     groups: tuple[_ForwardGroupPlan, ...]
+    # Physical token count: every group's packed length rounded up to the TP
+    # multiple that execution pads it to (see ``_physical_tokens``).
     packed_tokens: int
     logical_tokens: int
     output_bytes: int
@@ -1066,19 +1068,13 @@ class TrainerRank:
                 "therefore requires PP=1 with exactly one local model chunk; "
                 f"got pp={pp_size}, chunks={len(runtime.model)}"
             )
-        tp_size = int(getattr(runtime.provider, "tensor_model_parallel_size", 1) or 1)
-        try:
-            from megatron.core import parallel_state as ps
-
-            tp_size = max(tp_size, int(ps.get_tensor_model_parallel_world_size()))
-        except (AssertionError, ImportError, RuntimeError, ValueError):
-            pass
-        if tp_size > 1:
-            raise TrainerRankRuntimeSupportError(
-                "TrainerRank automatic planning currently requires TP=1: the "
-                "planner's admission model is not yet calibrated for "
-                f"tensor-parallel execution (got tp={tp_size})"
-            )
+        # Tensor parallelism is admitted: the vocab-parallel head, sequence-
+        # parallel gather, TP padding of packed batches and sharded LoRA
+        # gradient reduction pre-date the planner, memory checks all-reduce
+        # within the TP x CP group, and the memory profile is keyed by topology
+        # so TP calibrates itself online. Known limitations: the cost model
+        # carries no TP terms and the cold static estimate ignores sharding
+        # (conservative); both are recalibration follow-ups.
         self.runtime: TrainingRuntime = runtime
         self.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
@@ -2274,7 +2270,7 @@ class TrainerRank:
                 max_depth=len(group_indices),
             )
             assert estimated is not None  # rows are CPU copies
-            packed_tokens += estimated
+            packed_tokens += self._physical_tokens(estimated)
         return self._subforward_cost(
             packed_tokens=packed_tokens,
             output_bytes=self._estimate_group_request_output_bytes(requests),
@@ -3637,7 +3633,9 @@ class TrainerRank:
                 for request in requests
             ),
             groups=tuple(plans),
-            packed_tokens=sum(int(plan.packed.tokens.numel()) for plan in plans),
+            packed_tokens=sum(
+                self._physical_tokens(int(plan.packed.tokens.numel())) for plan in plans
+            ),
             logical_tokens=logical_tokens,
             output_bytes=output_bytes,
             signature=self._memory_signature_from_requests(
@@ -3679,7 +3677,7 @@ class TrainerRank:
                     ),
                     memory_minimal=memory_minimal,
                 )
-                packed_tokens += layout.packed_tokens
+                packed_tokens += self._physical_tokens(layout.packed_tokens)
                 continue
             # Radix depth is bounded by the number of rows, so ``len(group)``
             # is an unlimited-sharing depth for this group; it is a bound for
@@ -3690,7 +3688,7 @@ class TrainerRank:
             )
             if group_packed_tokens is None:
                 return None
-            packed_tokens += group_packed_tokens
+            packed_tokens += self._physical_tokens(group_packed_tokens)
 
         return (
             packed_tokens,
@@ -4098,6 +4096,18 @@ class TrainerRank:
             )
         except (AssertionError, AttributeError, ImportError, RuntimeError, ValueError):
             return (1, 1, 1, 1)
+
+    def _physical_tokens(self, packed_tokens: int) -> int:
+        """Physical length of one packed group: padded to a multiple of TP.
+
+        Execution pads every group independently (``_pad_packed_batch``), so
+        admission, the cheap bounds and the memory profile all count tokens
+        the same way; the omission would otherwise grow with the number of
+        groups, not stay below TP.
+        """
+
+        multiple = max(1, self._topology_key()[1])
+        return packed_tokens + (-packed_tokens % multiple)
 
     def _memory_check(
         self,
