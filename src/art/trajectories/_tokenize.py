@@ -3846,10 +3846,67 @@ def _mark_sampled_stops(
             flags[index] |= TokenFlag.STOP
 
 
+@dataclass(frozen=True)
+class _RenderedLengthStopBoundary:
+    tail: tuple[int, ...]
+    following: tuple[int, ...]
+
+
+def _rendered_length_stop_boundary(
+    token_ids: Sequence[int],
+    assistant_mask: Sequence[bool],
+    stop_mask: Sequence[bool],
+    *,
+    content_end: int,
+    next_prompt_end: int,
+) -> _RenderedLengthStopBoundary | None:
+    """Prove one assistant stop tail through the next generation boundary."""
+
+    if not (
+        len(token_ids) == len(assistant_mask) == len(stop_mask)
+        and 0 <= content_end < next_prompt_end <= len(token_ids)
+    ):
+        return None
+    end = content_end
+    stops: list[int] = []
+    while end < len(token_ids) and assistant_mask[end]:
+        if stop_mask[end]:
+            stops.append(end)
+        end += 1
+    if (
+        len(stops) != 1
+        or stops[0] != end - 1
+        or end > next_prompt_end
+        or any(assistant_mask[end:next_prompt_end])
+    ):
+        return None
+    return _RenderedLengthStopBoundary(
+        tail=tuple(token_ids[content_end:end]),
+        following=tuple(token_ids[end:next_prompt_end]),
+    )
+
+
+def _next_assistant_span_start(
+    assistant_mask: Sequence[bool], *, after: int
+) -> int | None:
+    if not 0 <= after < len(assistant_mask):
+        return None
+    return next(
+        (
+            index
+            for index in range(after + 1, len(assistant_mask))
+            if assistant_mask[index] and not assistant_mask[index - 1]
+        ),
+        None,
+    )
+
+
 def _tokenize_exact_projected_chat_history(
     history: ChatCompletionsHistory,
     *,
     tokenizer: Tokenizer | None,
+    length_stop_boundaries: Mapping[_SampledSourceKey, _RenderedLengthStopBoundary]
+    | None = None,
     projection_validated: bool = False,
     _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory | None:
@@ -3876,8 +3933,34 @@ def _tokenize_exact_projected_chat_history(
     final_output, final_logprobs = _chat_source_full_tokens(final_source)
     if final_prompt is None or final_output is None:
         return None
+    final_key = _sampled_source_key(final_source)
+    final_stop_reason = _source_stop_evidence(final_source, final_key)[0]
+    terminal_boundary = (
+        (length_stop_boundaries or {}).get(final_key)
+        if final_stop_reason == "length"
+        else None
+    )
+    if final_stop_reason == "length" and (
+        terminal_boundary is None or not terminal_boundary.tail
+    ):
+        return None
 
-    token_ids = [*final_prompt, *final_output]
+    # The final prompt proves every earlier boundary. Only this terminal tail
+    # remains renderer-owned, so keep it synthetic as in ordinary rendering.
+    terminal_tail = (
+        [*terminal_boundary.tail, *terminal_boundary.following]
+        if terminal_boundary is not None
+        else []
+    )
+    terminal_flags = (
+        [
+            *([TokenFlag.ASSISTANT] * len(terminal_boundary.tail)),
+            *([TokenFlag(0)] * len(terminal_boundary.following)),
+        ]
+        if terminal_boundary is not None
+        else []
+    )
+    token_ids = [*final_prompt, *final_output, *terminal_tail]
     logprobs = [
         *([math.nan] * len(final_prompt)),
         *(
@@ -3885,6 +3968,7 @@ def _tokenize_exact_projected_chat_history(
             if len(final_logprobs) == len(final_output)
             else [math.nan] * len(final_output)
         ),
+        *([math.nan] * len(terminal_tail)),
     ]
     flags = [
         *([TokenFlag.EXACT] * len(final_prompt)),
@@ -3892,11 +3976,16 @@ def _tokenize_exact_projected_chat_history(
             [TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT]
             * len(final_output)
         ),
+        *terminal_flags,
     ]
-    final_key = _sampled_source_key(final_source)
+    if terminal_boundary is not None:
+        flags[
+            len(final_prompt) + len(final_output) + len(terminal_boundary.tail) - 1
+        ] = TokenFlag.STOP
     source_keys: list[_SampledSourceKey | None] = [
         *([None] * len(final_prompt)),
         *([final_key] * len(final_output)),
+        *([None] * len(terminal_tail)),
     ]
     sources: dict[_SampledSourceKey, object] = {final_key: final_source}
     for index, source in enumerate(sampled_sources[:-1]):
@@ -3938,6 +4027,31 @@ def _tokenize_exact_projected_chat_history(
         ] * len(retained_ids)
         logprobs[start:end] = retained_logprobs
         source_key = _sampled_source_key(source)
+        if _source_stop_evidence(source, source_key)[0] == "length":
+            boundary = (length_stop_boundaries or {}).get(source_key)
+            next_prompt = _chat_source_prompt_tokens(sampled_sources[index + 1])
+            boundary_end = (
+                end + len(boundary.tail) + len(boundary.following)
+                if boundary is not None
+                else end
+            )
+            if (
+                retained_ids != output
+                or boundary is None
+                or not boundary.tail
+                or next_prompt is None
+                or len(next_prompt) != boundary_end
+                or final_prompt[end:boundary_end]
+                != [*boundary.tail, *boundary.following]
+            ):
+                # Without a later exact prompt containing the complete sampled
+                # output and renderer-proven boundary, render the stop.
+                return None
+            tail_end = end + len(boundary.tail)
+            flags[end:tail_end] = [TokenFlag.EXACT | TokenFlag.ASSISTANT] * len(
+                boundary.tail
+            )
+            flags[tail_end - 1] = TokenFlag.EXACT | TokenFlag.STOP
         source_keys[start:end] = [source_key] * len(retained_ids)
         sources[source_key] = source
     if history.model is None:
@@ -4968,6 +5082,95 @@ def _tokenize_chat_view(
                 continue
             if span := differing_span(probe):
                 probed_bounds[message_index] = span
+
+    if (
+        _projection_matches is True
+        and chat_template is None
+        and chat_template_kwargs is None
+        and not _history_needs_synthetic_stop(history, resolved_tokenizer)
+    ):
+        sampled_message_indices: list[int] = []
+        seen_signatures: set[tuple[object, ...]] = set()
+        for message_index, (message, source) in enumerate(
+            zip(messages, history.message_sources, strict=True)
+        ):
+            signature = _source_signature(source)
+            if (
+                message.get("role") == "assistant"
+                and source is not None
+                and signature is not None
+                and signature not in seen_signatures
+                and _source_is_sampled(source)
+            ):
+                seen_signatures.add(signature)
+                sampled_message_indices.append(message_index)
+        length_stop_boundaries: dict[
+            _SampledSourceKey, _RenderedLengthStopBoundary
+        ] = {}
+        length_stop_count = 0
+        for position, message_index in enumerate(sampled_message_indices):
+            source = history.message_sources[message_index]
+            assert source is not None
+            source_key = _sampled_source_key(source)
+            if _source_stop_evidence(source, source_key)[0] != "length":
+                continue
+            length_stop_count += 1
+            bounds = (
+                direct_bounds[message_index]
+                if direct_bounds
+                else marked_bounds.get(message_index)
+                or probed_bounds.get(message_index)
+            )
+            next_prompt_end: int | None
+            if position + 1 < len(sampled_message_indices):
+                next_message_index = sampled_message_indices[position + 1]
+                next_bounds = (
+                    direct_bounds[next_message_index]
+                    if direct_bounds
+                    else marked_bounds.get(next_message_index)
+                    or probed_bounds.get(next_message_index)
+                )
+                next_prompt_end = (
+                    next_bounds[0]
+                    if next_bounds is not None
+                    else _next_assistant_span_start(assistant_mask, after=bounds[1])
+                    if bounds is not None
+                    else None
+                )
+            else:
+                next_prompt_end = len(rendered)
+            boundary = (
+                _rendered_length_stop_boundary(
+                    rendered,
+                    assistant_mask,
+                    stop_mask,
+                    content_end=bounds[1],
+                    next_prompt_end=next_prompt_end,
+                )
+                if (
+                    bounds is not None
+                    and source_matches_context(source)
+                    and next_prompt_end is not None
+                )
+                else None
+            )
+            if boundary is None:
+                break
+            length_stop_boundaries[source_key] = boundary
+        if (
+            length_stop_count
+            and len(length_stop_boundaries) == length_stop_count
+            and (
+                exact := _tokenize_exact_projected_chat_history(
+                    history,
+                    tokenizer=resolved_tokenizer,
+                    length_stop_boundaries=length_stop_boundaries,
+                    projection_validated=True,
+                    _trace=_trace,
+                )
+            )
+        ):
+            return exact
 
     sampled_message_count = sum(
         message.get("role") == "assistant"
