@@ -16,6 +16,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 import hashlib
+import logging
 import math
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ from typing import (
     Any,
     Generic,
     Literal,
+    NamedTuple,
     NotRequired,
     Self,
     SupportsIndex,
@@ -48,7 +50,7 @@ from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
 )
-from art.trainer_rank._planner_cost import COEFFICIENT_VERSION
+from art.trainer_rank._planner_cost import coefficient_version_for
 from art.trainer_rank._prefix_tree_materializer import materialize_prefix_tree_layout
 from art.trainer_rank._prefix_tree_planner import (
     CanonicalPrefixTree,
@@ -115,6 +117,8 @@ _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
 # Test-only layout anchor forcing for paired acceptance measurement. Both
 # variables must be set; the hook is inert in production.
+logger = logging.getLogger(__name__)
+
 _TEST_HOOKS_ENV = "ART_TRAINER_RANK_TEST_HOOKS"
 _TEST_ANCHOR_ENV = "ART_TRAINER_RANK_TEST_ANCHOR"
 # Test-only usable-memory cap (bytes) for split/decline acceptance cells.
@@ -1032,6 +1036,33 @@ def _local_wave_indices(
     return tuple(range(start + dp_rank, start + width, dp_size))
 
 
+class _PlannerFacts(NamedTuple):
+    """Topology and model facts the layout scorer prices against."""
+
+    cp_size: int
+    tp_size: int
+    layers: int
+    gdn_layers: int
+    uses_gdn: bool
+    # Score version for this runtime: the fitted table inside its calibrated
+    # capability profile, the fallback outside it (see coefficient_version_for).
+    coefficient_version: int
+
+
+# Content hash, planner facts (including the coefficient version), anchor.
+_LayoutKey = tuple[str, _PlannerFacts, str | None]
+
+
+def _gdn_layer_count(model: torch.nn.Module) -> int:
+    """Number of gated-delta-net layers in the model (0 when unavailable)."""
+
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return 0
+    return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
+
+
 def _split_chunks(
     order: Sequence[int],
     requests: Sequence[AnyForwardInput],
@@ -1071,10 +1102,10 @@ class TrainerRank:
         # Tensor parallelism is admitted: the vocab-parallel head, sequence-
         # parallel gather, TP padding of packed batches and sharded LoRA
         # gradient reduction pre-date the planner, memory checks all-reduce
-        # within the TP x CP group, and the memory profile is keyed by topology
-        # so TP calibrates itself online. Known limitations: the cost model
-        # carries no TP terms and the cold static estimate ignores sharding
-        # (conservative); both are recalibration follow-ups.
+        # within the TP x CP group, the memory profile is keyed by topology so
+        # TP calibrates itself online, and the fitted layout cost model prices
+        # TP explicitly. Known limitation: the cold static memory estimate
+        # ignores sharding (conservative).
         self.runtime: TrainingRuntime = runtime
         self.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
@@ -1091,6 +1122,47 @@ class TrainerRank:
             or getattr(runtime.provider, "num_layers", 1)
             or 1
         )
+        # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
+        # cost model prices GDN state hand-offs per GDN layer, not per layer.
+        self._gdn_layers = _gdn_layer_count(runtime.model[0])
+        if self._gdn_layers == 0 and bool(
+            getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
+        ):
+            self._gdn_layers = self._num_layers
+        # The fitted layout cost model applies only inside the capability
+        # profile it was calibrated on; other runtimes keep the previous score.
+        parameter = next(runtime.model[0].parameters())
+        capability: tuple[int, int] | None = None
+        device_memory: int | None = None
+        if parameter.device.type == "cuda":
+            capability = torch.cuda.get_device_capability(parameter.device)
+            device_memory = int(
+                torch.cuda.get_device_properties(parameter.device).total_memory
+            )
+        spec = getattr(runtime, "model_support_spec", None)
+        is_moe = bool(
+            getattr(spec, "is_moe", False)
+            or getattr(runtime.model_support_handler, "is_moe", False)
+        )
+        self._coefficient_version = coefficient_version_for(
+            device_capability=capability,
+            device_memory_bytes=device_memory,
+            param_dtype=str(parameter.dtype),
+            hidden_size=int(self._hidden_size),
+            is_moe=is_moe,
+        )
+        if self._coefficient_version != 2:
+            logger.warning(
+                "TrainerRank layout cost model: runtime (capability=%s, device "
+                "memory=%s, dtype=%s, hidden=%s, moe=%s) is outside the calibrated "
+                "profile; using the version-%d score",
+                capability,
+                device_memory,
+                parameter.dtype,
+                self._hidden_size,
+                is_moe,
+                self._coefficient_version,
+            )
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
@@ -1126,7 +1198,7 @@ class TrainerRank:
         # content on consecutive calls); fresh-token training steps must not
         # accumulate entries for the lifetime of the rank.
         self._layout_selection_cache: OrderedDict[
-            tuple[str, int, int, bool, int, str | None],
+            _LayoutKey,
             tuple[CanonicalPrefixTree, PrefixTreeLayout],
         ] = OrderedDict()
         self._tree_cache: OrderedDict[str, CanonicalPrefixTree] = OrderedDict()
@@ -3518,14 +3590,21 @@ class TrainerRank:
             return None
         return os.environ.get(_TEST_ANCHOR_ENV) or None
 
-    def _planner_topology_facts(self) -> tuple[int, int, bool]:
-        cp_size = self._topology_key()[2]
+    def _planner_topology_facts(self) -> "_PlannerFacts":
+        _dp, tp_size, cp_size, _pp = self._topology_key()
         uses_gdn = bool(
             getattr(
                 self.runtime.model_support_handler, "build_gdn_execution_spec", False
             )
         )
-        return cp_size, self._num_layers, uses_gdn
+        return _PlannerFacts(
+            cp_size=cp_size,
+            tp_size=tp_size,
+            layers=self._num_layers,
+            gdn_layers=self._gdn_layers if uses_gdn else 0,
+            uses_gdn=uses_gdn,
+            coefficient_version=self._coefficient_version,
+        )
 
     def _layout_anchor(self, *, memory_minimal: bool) -> str | None:
         """Resolve the layout anchor: test forcing wins, else memory policy."""
@@ -3540,8 +3619,8 @@ class TrainerRank:
         input_ids: Sequence[torch.Tensor],
         *,
         memory_minimal: bool = False,
-    ) -> tuple[str, int, int, bool, int, str | None]:
-        cp_size, layers, uses_gdn = self._planner_topology_facts()
+    ) -> "_LayoutKey":
+        facts = self._planner_topology_facts()
         hasher = hashlib.sha256()
         for tensor in input_ids:
             row = tensor.detach().reshape(-1).cpu().contiguous()
@@ -3550,16 +3629,13 @@ class TrainerRank:
             hasher.update(row.numpy())
         return (
             hasher.hexdigest(),
-            cp_size,
-            layers,
-            uses_gdn,
-            COEFFICIENT_VERSION,
+            facts,
             self._layout_anchor(memory_minimal=memory_minimal),
         )
 
     def _cached_group_layout(
         self,
-        key: tuple[str, int, int, bool, int, str | None],
+        key: "_LayoutKey",
     ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout] | None:
         with self._layout_cache_lock:
             cached = self._layout_selection_cache.get(key)
@@ -3570,7 +3646,7 @@ class TrainerRank:
     def _compute_group_layout(
         self,
         input_ids: Sequence[torch.Tensor],
-        key: tuple[str, int, int, bool, int, str | None],
+        key: "_LayoutKey",
     ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
         """Plan one group and memoize the result.
 
@@ -3581,7 +3657,7 @@ class TrainerRank:
         memory-minimal layouts of one group share a single construction.
         """
 
-        content_key, cp_size, layers, uses_gdn, _, anchor = key
+        content_key, facts, anchor = key
         with self._layout_cache_lock:
             tree = self._tree_cache.get(content_key)
             if tree is not None:
@@ -3603,9 +3679,12 @@ class TrainerRank:
         else:
             layout = select_prefix_tree_layout(
                 tree,
-                cp_size=cp_size,
-                layers=layers,
-                uses_gdn=uses_gdn,
+                cp_size=facts.cp_size,
+                layers=facts.layers,
+                uses_gdn=facts.uses_gdn,
+                tp_size=facts.tp_size,
+                gdn_layers=facts.gdn_layers,
+                coefficient_version=facts.coefficient_version,
                 refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
             ).layout
         cached = (tree, layout)
@@ -3701,7 +3780,7 @@ class TrainerRank:
             pending: list[
                 tuple[
                     tuple[torch.Tensor, ...],
-                    tuple[str, int, int, bool, int, str | None],
+                    _LayoutKey,
                 ]
             ] = []
             for _, group_indices in groups:
@@ -4228,7 +4307,7 @@ class TrainerRank:
         modes = tuple(sorted(grad_modes))
         return _MemorySignature(
             topology=self._topology_key(),
-            planner_coefficients=COEFFICIENT_VERSION,
+            planner_coefficients=self._coefficient_version,
             slot_group_count=slot_group_count,
             request_mix=tuple(
                 sorted({_request_mix_key(request) for request in requests})

@@ -59,9 +59,12 @@ document records the verified facts the acceptance suite pins).
 ## Verified facts the acceptance suite pins (empirical, research planner)
 
 - Sealed GPU win-cell shape (GRPO 2x8, system 2048 / prompt 8192 /
-  completion 512): production score selects depth 3, 26,624 physical tokens
-  for 172,032 logical — identical at layers=2 and layers=12; matches the
-  sealed cold witness exactly.
+  completion 512): the landing's version-1 score selected depth 3, 26,624
+  physical tokens for 172,032 logical (the sealed cold witness). The fitted
+  version-2 score selects prompt-level sharing at CP4 (depth 2, 28,672
+  physical — the measured fastest layout there, 791 ms vs 872 ms for full
+  sharing) and full sharing (26,624) at CP1; both satisfy the gate (depth > 1,
+  under a quarter of the logical tokens).
 - Heterogeneous control (16 unique 4k rows): selects depth 1, no decisions.
 - Tiny sealed-corpus families (grpo_like/deep_comb/mixed_branch): production
   score correctly selects NO sharing (tiny segments cannot pay GDN/CP costs).
@@ -72,25 +75,118 @@ document records the verified facts the acceptance suite pins).
 - Candidate family on those trees retains all anchors: 0-decision, full-
   decision, and depth-1 layouts present; exhaustive layout counts 4/2048/1024.
 
-## Calibrated production score (provenance: research `_impl.py` frozen source,
-mirrored and test-locked by the sealed gate harness)
+## Fitted production score (coefficient version 2)
+
+The landing shipped the research thread's layout score with constants that
+were, as the research thread later confirmed, hand-set rather than fitted
+(1 µs per token per layer as a structural scale; `96 + 32·cp` per segment and
+`64 + 32·cp` per shared edge hand-shaped; 768 µs per GDN layer as the smallest
+quantum preserving four measured winners; 256 µs as a launch-floor proxy),
+applied to the total layer count rather than the GDN layer count, and blind
+to TP. The recalibration replaced them with a fitted table
+(`_planner_cost.COEFFICIENTS_MILLI_US`, integer milli-microseconds per
+feature unit) over ten interpretable integer term functions
+(`_planner_cost.TERM_FUNCTIONS`) of four O(segments) layout features
+(`layout_features`: packed tokens, segment count, dependency levels, a
+segment-length histogram) and the planner facts (cp, tp, layers, GDN
+layers). The ten terms are the ones that carried weight in the calibration:
+per-rank token work with CP-exchange and TP-collective terms, a GDN per-token
+surcharge, attention KV exchange across CP ranks, tiny-per-rank segments per
+layer, dependency levels crossing CP or TP ranks, and GDN level hand-offs with
+their TP interaction. Candidate terms that fitted to zero (segment launches,
+fan-out, shared tokens, attention area, small-M token surcharges) were dropped
+from the module; a future campaign can reintroduce them.
+Only quantities that differ between a call's layouts are priced; everything
+a call shares (logical tokens, the output head, model size) cancels in
+ranking.
 
 ```
-cp = max(1, cp_size); L = max(1, layers)
-transformer = packed_tokens * 1024
-imbalance   = ceil(packed_tokens / cp) * (96 + 32*cp)
-launch      = segment_count * (96 + 32*cp) * 1024
-exchanges   = selected_decision_count * (64 + 32*cp) * 1024
-gdn         = uses_gdn * ( min(1, max(0, depth-1)) * L * 768 * 1024
-                         + max(0, depth-2)         * L * 256 * 1024 )
-total = L * transformer + imbalance + launch + exchanges + gdn
-score = (total, packed_tokens, segment_count, maximum_depth)   # lexicographic
+score = (Σ_term coefficient[term] · term(features, facts), packed_tokens,
+         segment_count, maximum_depth)                           # lexicographic
 ```
 
-Known limitation carried from research: this undervalues full sharing on some
-GRPO cells (sealed: full-sharing arm 875.7 ms vs automatic 1,132.8 ms on the
-win cell). Constants are versioned (`coefficient_version`) for future
-recalibration; not addressed in this PR.
+Calibration protocol (`--phase cost-calibrate`, `dev/trainer_rank_cost_fit.py`):
+every mandatory candidate layout of a cell (and the production selection) is
+timed through the public API — forward and backward through an active LoRA
+slot, compile-free, max-rank — with its features; the fit is a non-negative
+least squares on within-cell paired timing deltas (cells weighted equally,
+pairs weighted by their scale), refined by a deterministic regret-minimizing
+coordinate search, validated on whole held-out cells. Cells: hierarchical
+GRPO g8/g16/g4x4 shapes on Qwen3.5-4B (GDN, 24 of 32 layers) and Qwen3-4B
+(attention) at 2 layers and full height, three heterogeneous controls, and
+real Ellavox groups, at TP1/TP2 × CP1/CP2/CP4 on H200 bf16.
+
+What the data showed:
+- The cost of an additional shared prefix level is a GDN effect: on the GDN
+  model it grows when the level's state hand-offs cross CP or TP ranks (at
+  CP4 and TP2 sharing a 1,023-token system across two prompt groups is a net
+  loss; at TP1/CP1 it is a win), while the attention model pays almost
+  nothing for it and benefits from the extra level even at CP4.
+- Per-rank token work scales with `tp × cp`, GDN layers cost more per token
+  than attention layers, and rows in segments that are short *per rank*
+  (threshold × cp) run inefficient kernels.
+- The sealed "full sharing 876 ms vs automatic 1,133 ms" gap on the win cell
+  was the research run's online calibration wandering between five layouts;
+  the frozen version-1 score actually selected full sharing there. Its real
+  misranking on that cell was prompt-level sharing (791 ms) vs full sharing
+  (872 ms) — an ~80 ms level cost the model priced at under 1 ms.
+
+Gates (held-out cells, noise-qualified): pairwise ordering ≥ 90% on pairs
+separated by more than 3%, median regret ≤ 2%, p95 ≤ 5%, none above 10%,
+clear winners selected within 5%. The table is fitted on 45 cells and
+evaluated on all 56 (3,844 within-cell pairs; the 11 odd Ellavox groups are
+the pre-registered holdout): it ranks 98.1% of separated pairs correctly, p95
+regret 2.9%, max 4.2%, no clear misses; the holdout passes. Ablations withholding
+every TP2 cell, every CP2 cell, or the whole attention model pass; withholding
+every heterogeneous cell misranks one CP4 heterogeneous cell by 9.5%, and
+withholding every CP4 cell does not extrapolate (25%), so those cells stay in
+the fit. Robustness: the table fitted on the first 38 cells, run through the
+real selector on the 18 later cells, was already within 4.2% everywhere, and
+the production selection timed in the later CP2/TP2 cells had median regret
+−0.2%, max 0.4%. The hand-set version-1 score on the same 56 cells: 78.6%
+pairwise, max regret 67% (an Ellavox group at CP2).
+
+Calibrated domain: the table applies only inside `CalibrationProfile`, which
+is narrowed to exactly what the certificate measured and bound to it by test —
+compute capability 9.0 with an H200-class memory system (the 80 GB H100 shares
+the capability and is excluded by device memory), bf16, hidden size 2,560,
+dense models; everything else keeps the version-1 score (kept verbatim) with a
+one-time warning. `dev/trainer_rank_cost_calibration_manifest.json` lists the
+exact cells each recipe launches; the fitter's `--manifest` validation requires
+every non-excluded cell to be present and complete, rejects unexpected cells
+and duplicate cells with differing execution fingerprints, and the certificate
+test asserts the 56 retained identities plus the two explicit exclusions.
+
+Landing gates re-derived: the sealed win-cell shape still selects deep sharing
+(prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
+the heterogeneous control and the tiny sealed families still decline, and
+selection stays deterministic. The coefficient version is part of the planner
+facts and therefore of every layout cache key, so the new table invalidates
+cached recipes.
+
+Calibrated domain (review finding): the table was measured on one capability
+class, so it applies only inside `CalibrationProfile` — compute capability
+9.0, bf16, hidden size 2,048–3,072, non-MoE — and TrainerRank keeps the
+version-1 score (kept verbatim as the fallback) outside it, logging once. The
+gate is capability-based, never model-name-based; extending the domain means
+running the calibration cells on the new hardware or width and widening the
+profile with evidence. CPU-only planning (unit tests) uses the fitted table.
+
+Reproducibility (review finding): `dev/trainer_rank_cost_calibration_certificate.json`
+binds the shipped table to its data — per-cell candidate features, median
+timings, counts, spreads and fingerprints (no tokens, no per-sample rows), the
+exact fit arguments including any explicit cell exclusions, the integer table
+and its hash, and the headline metrics. `tests/unit/test_planner_cost_certificate.py`
+asserts the shipped table is the certified table and that the certified
+metrics hold on the recorded aggregates; `--from-certificate` re-fits from it.
+The runners propagate every cell failure (no masked exit codes) and the
+fitter refuses to fit incomplete evidence unless the gaps are excluded
+explicitly (`--require-complete`, `--exclude-cells`). Two Ellavox CP4 cells
+(groups 1 and 4) are excluded this way: their CP4 executions hang
+deterministically in NCCL all-to-alls in the context-parallel group
+(reproduced on a fresh cluster at identical collective sequence numbers) — a
+pre-existing CP4 execution bug, tracked as issue #840; the version-1 score
+selects the hanging layout for group 4, the fitted table happens not to.
 
 ## Width feasibility is decided by the memory-minimal layout
 
