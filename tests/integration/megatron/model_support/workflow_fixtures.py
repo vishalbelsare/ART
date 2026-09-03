@@ -17,7 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
-_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 7}
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 8}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -48,7 +48,7 @@ _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
 }
 _TOKENIZER_FIXTURE_VERSION = 3
 _FUNCTIONAL_FIXTURE_VERSION = 1
-_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 5}
+_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 7}
 _FUNCTIONAL_REMOTE_CODE_FILES = {
     "nemotron_h_moe": (
         "configuration_nemotron_h.py",
@@ -69,6 +69,9 @@ _REVISIONS = {
     "openai/gpt-oss-20b": "6cee5e81ee83917806bbde320786a8fb61efebee",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": (
         "2d59de1cbd51c0adf384eb906b766d1aee0e0517"
+    ),
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": (
+        "b3caaabed0263651a17dc1f2d4ce97e794f76c44"
     ),
 }
 _MULTIMODAL = {"qwen3_5_dense", "qwen3_5_moe", "gemma4_dense", "gemma4_moe"}
@@ -264,6 +267,7 @@ _PLAIN_TEXT: dict[str, tuple[int, int, dict[str, Any]]] = {
             "moe_shared_expert_intermediate_size": 512,
             "n_routed_experts": 4,
             "num_experts_per_tok": 2,
+            "num_nextn_predict_layers": 0,
             "tie_word_embeddings": False,
         },
     ),
@@ -327,7 +331,18 @@ _MULTIMODAL_SHAPES = {
 }
 # fmt: on
 
-_FUNCTIONAL_LAYER_FIELDS = ("layer_types", "mlp_layer_types", "indexer_types")
+_FUNCTIONAL_LAYER_FIELDS = (
+    "layer_types",
+    "layers_block_type",
+    "mlp_layer_types",
+    "indexer_types",
+)
+_HYBRID_LAYER_SYMBOLS = {
+    "mamba": "M",
+    "moe": "E",
+    "attention": "*",
+    "mlp": "-",
+}
 _WIDTH_TERMS = ("hidden", "intermediate", "head", "expert", "lora_rank", "topk")
 
 
@@ -360,7 +375,11 @@ _FUNCTIONAL_PLANS = {
     "dsv4": _plan(6, "layers", auxiliary=("mtp", "num_nextn_predict_layers")),
     "glm52": _plan(10, "model.layers", auxiliary=(None, "num_nextn_predict_layers")),
     "gpt_oss_moe": _plan(4, "model.layers"),
-    "nemotron_h_moe": _plan(6, "backbone.layers"),
+    "nemotron_h_moe": _plan(
+        6,
+        "backbone.layers",
+        auxiliary=("mtp.layers", "num_nextn_predict_layers"),
+    ),
 }
 _FUNCTIONAL_PATTERNS = {
     "qwen3_dense": {"layer_types": ("full_attention",) * 2},
@@ -393,7 +412,20 @@ def _configure(
     }
     if model_key in _PLAIN_TEXT:
         layers, hidden, values = _PLAIN_TEXT[model_key]
-        text = _set(_common(config, layers=layers, hidden=hidden, **common), **values)
+        text = _common(config, layers=layers, hidden=hidden, **common)
+        values = dict(values)
+        hybrid_pattern = values.pop("hybrid_override_pattern", None)
+        if hybrid_pattern is not None:
+            layer_types = getattr(text, "layer_types", None)
+            if isinstance(layer_types, (list, tuple)):
+                actual_pattern = "".join(
+                    _HYBRID_LAYER_SYMBOLS[layer_type] for layer_type in layer_types
+                )
+                if actual_pattern != hybrid_pattern:
+                    raise RuntimeError(f"{model_key} reduced hybrid pattern changed")
+            else:
+                text.hybrid_override_pattern = hybrid_pattern
+        text = _set(text, **values)
         if model_key == "glm52":
             text.vocab_size = source_vocab_size
         return config
@@ -459,6 +491,19 @@ def _pack_qwen35_experts(path: Path, config: Any) -> None:
     save_file(tensors, checkpoint, metadata={"format": "pt"})
 
 
+def _restore_nemotron_h_embedding_name(path: Path) -> None:
+    from safetensors.torch import load_file, save_file
+
+    checkpoint = path / "model.safetensors"
+    tensors = load_file(checkpoint)
+    source = "backbone.embedding.weight"
+    target = "backbone.embeddings.weight"
+    if source not in tensors or target in tensors:
+        raise RuntimeError("Nemotron-H HF embedding serialization changed")
+    tensors[target] = tensors.pop(source)
+    save_file(tensors, checkpoint, metadata={"format": "pt"})
+
+
 def _json_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -499,14 +544,21 @@ def _config_shape(config: dict[str, Any], *exclude: str) -> dict[str, object]:
     }
 
 
+def _functional_depth(text: dict[str, Any], *, model_key: str) -> int:
+    depth = text.get("num_hidden_layers")
+    if depth is None and isinstance(text.get("layers_block_type"), list):
+        depth = len(text["layers_block_type"])
+    if type(depth) is not int or depth < _functional_plan(model_key).depth:
+        raise RuntimeError(f"{model_key} has invalid production depth")
+    return depth
+
+
 def _functional_config(
     source: dict[str, Any], *, model_key: str
 ) -> tuple[dict[str, Any], dict[str, object]]:
     plan = _functional_plan(model_key)
     text = _config_text(source, plan)
-    source_depth = text.get("num_hidden_layers")
-    if type(source_depth) is not int or source_depth < plan.depth:
-        raise RuntimeError(f"{model_key} has invalid production depth")
+    source_depth = _functional_depth(text, model_key=model_key)
     reduced = json.loads(json.dumps(source))
     reduced_text = _config_text(reduced, plan)
     reduced_text["num_hidden_layers"] = plan.depth
@@ -523,12 +575,26 @@ def _functional_config(
                 raise RuntimeError(f"{model_key} production {field} is incomplete")
             patterns[field] = values[: plan.depth]
             reduced_text[field] = patterns[field]
-    hybrid_pattern = text.get("hybrid_override_pattern")
+    serialized_hybrid_pattern = text.get("hybrid_override_pattern")
+    hybrid_pattern = serialized_hybrid_pattern
+    if (layer_types := text.get("layers_block_type")) is not None:
+        try:
+            layer_types_pattern = "".join(
+                _HYBRID_LAYER_SYMBOLS[layer_type] for layer_type in layer_types
+            )
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"{model_key} production layers_block_type is invalid"
+            ) from exc
+        if hybrid_pattern is not None and hybrid_pattern != layer_types_pattern:
+            raise RuntimeError(f"{model_key} production hybrid patterns disagree")
+        hybrid_pattern = layer_types_pattern
     if hybrid_pattern is not None:
         if not isinstance(hybrid_pattern, str) or len(hybrid_pattern) != source_depth:
             raise RuntimeError(f"{model_key} production hybrid pattern is invalid")
         patterns["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
-        reduced_text["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
+        if serialized_hybrid_pattern is not None:
+            reduced_text["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
     for field, expected in _FUNCTIONAL_PATTERNS.get(model_key, {}).items():
         actual = patterns.get(field)
         if (tuple(actual) if isinstance(actual, list) else actual) != expected:
@@ -630,7 +696,7 @@ def _select_functional_weights(
 ) -> dict[str, str]:
     plan = _functional_plan(model_key)
     text_config = _config_text(config, plan)
-    source_depth = int(text_config["num_hidden_layers"])
+    source_depth = _functional_depth(text_config, model_key=model_key)
     text_layers: set[int] = set()
     vision_layers: set[int] = set()
     auxiliary_layers: set[int] = set()
@@ -666,13 +732,19 @@ def _select_functional_weights(
     count = text_config.get(auxiliary_count) if auxiliary_count else 0
     if type(count) is not int or count < 0:
         raise RuntimeError(f"{model_key} has invalid {auxiliary_count}")
+    auxiliary_depth = count
+    if auxiliary_prefix == "mtp.layers" and count:
+        mtp_layer_types = text_config.get("mtp_layers_block_type")
+        if not isinstance(mtp_layer_types, list) or not mtp_layer_types:
+            raise RuntimeError(f"{model_key} MTP layer pattern is invalid")
+        auxiliary_depth *= len(mtp_layer_types)
     expected = set(
         range(source_depth + (count if plan.auxiliary and not auxiliary_prefix else 0))
     )
     if text_layers != expected:
         raise RuntimeError(f"{model_key} canonical text-layer coverage changed")
     if auxiliary_prefix:
-        if auxiliary_layers != set(range(count)):
+        if auxiliary_layers != set(range(auxiliary_depth)):
             raise RuntimeError(
                 f"{model_key} canonical auxiliary-layer coverage changed"
             )
@@ -890,7 +962,12 @@ def _build(
         config.save_pretrained(staging)
         if functional:
             (staging / "config.json").write_text(json.dumps(reduced, indent=2) + "\n")
-            for name in _FUNCTIONAL_REMOTE_CODE_FILES.get(model_key, ()):
+            remote_code_files = (
+                _FUNCTIONAL_REMOTE_CODE_FILES.get(model_key, ())
+                if source_config.get("auto_map")
+                else ()
+            )
+            for name in remote_code_files:
                 if source_fixture is None:
                     raise RuntimeError(
                         f"{model_key} remote code requires a parent fixture"
@@ -944,24 +1021,32 @@ def _build(
                 if model_key == "nemotron_h_moe":
                     config.dtype = configured_dtype
                 fp32 = {}
+                backbone_prefix = None
                 if model_key == "nemotron_h_moe":
+                    backbone = getattr(model, "backbone", None)
+                    backbone_prefix = "backbone"
+                    if backbone is None:
+                        backbone = getattr(model, "model", None)
+                        backbone_prefix = "model"
+                    if backbone is None:
+                        raise RuntimeError("Nemotron-H HF fixture backbone changed")
                     pattern = str(config.hybrid_override_pattern)
                     for index, symbol in enumerate(pattern):
-                        mixer = model.backbone.layers[index].mixer
+                        mixer = backbone.layers[index].mixer
                         if symbol == "E":
                             torch.nn.init.normal_(
                                 mixer.gate.weight, std=float(config.initializer_range)
                             )
                         if symbol == "M":
-                            fp32[f"backbone.layers.{index}.mixer.A_log"] = (
+                            fp32[f"{backbone_prefix}.layers.{index}.mixer.A_log"] = (
                                 mixer.A_log.detach().clone()
                             )
-                            fp32[f"backbone.layers.{index}.mixer.D"] = (
+                            fp32[f"{backbone_prefix}.layers.{index}.mixer.D"] = (
                                 mixer.D.detach().clone()
                             )
                         elif symbol == "E":
                             fp32[
-                                f"backbone.layers.{index}.mixer.gate.e_score_correction_bias"
+                                f"{backbone_prefix}.layers.{index}.mixer.gate.e_score_correction_bias"
                             ] = mixer.gate.e_score_correction_bias.detach().clone()
                 model = model.to(torch.bfloat16)
                 tensors = dict(model.named_parameters()) | dict(model.named_buffers())
@@ -975,10 +1060,13 @@ def _build(
                         layer.post_attention_layernorm.weight.fill_(residual_scale)
                         layer.post_feedforward_layernorm.weight.fill_(residual_scale)
             if model_key == "nemotron_h_moe":
-                if model._tied_weights_keys != ["lm_head.weight"]:
+                if backbone_prefix == "backbone":
+                    if model._tied_weights_keys != ["lm_head.weight"]:
+                        raise RuntimeError("Nemotron-H HF tied-weight metadata changed")
+                    model._tied_weights_keys = {}
+                    model.register_for_auto_class("AutoModelForCausalLM")
+                elif model._tied_weights_keys != {}:
                     raise RuntimeError("Nemotron-H HF tied-weight metadata changed")
-                model._tied_weights_keys = {}
-                model.register_for_auto_class("AutoModelForCausalLM")
             parameters = sum(parameter.numel() for parameter in model.parameters())
             model.save_pretrained(
                 staging,
@@ -986,10 +1074,12 @@ def _build(
                 max_shard_size="2GB",
                 **(
                     {"save_original_format": False}
-                    if model_key == "nemotron_h_moe"
+                    if model_key == "nemotron_h_moe" and backbone_prefix == "backbone"
                     else {}
                 ),
             )
+            if model_key == "nemotron_h_moe" and backbone_prefix == "model":
+                _restore_nemotron_h_embedding_name(staging)
             del model
             gc.collect()
             if model_key == "qwen3_5_moe":
