@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import SupportsIndex, cast, overload
+from typing import Any, SupportsIndex, cast, overload
 from unittest.mock import patch
 
 import numpy as np
@@ -18,7 +18,7 @@ from art import TrainableModel
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.openai import ART_MOE_ROUTING_METADATA_KEY
-from art.preprocessing.moe_routing import MoeRouteSegments
+from art.preprocessing.moe_routing import MoeRouteArray
 from art.preprocessing.tokenize import (
     TokenizedResult,
     _chat_choice_trace,
@@ -42,7 +42,6 @@ from art.trajectories._selection import (
     resolve_training_model,
 )
 from art.trajectories._tokenize import (
-    _first_introduction_mask,
     _HistoryTokenizationTrace,
 )
 
@@ -257,36 +256,6 @@ class _Tokenizer:
     name_or_path = "base/model"
 
 
-def test_first_introduction_mask_trains_repeated_sources_once_across_histories() -> (
-    None
-):
-    seen: set[str] = set()
-    assert _first_introduction_mask([None, "a", "a"], seen) == [
-        False,
-        True,
-        True,
-    ]
-    assert _first_introduction_mask([None, "a", "a", None, "b"], seen) == [
-        False,
-        False,
-        False,
-        False,
-        True,
-    ]
-    assert _first_introduction_mask(
-        [None, "a", "a", None, "b", None, "c", "c"], seen
-    ) == [
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        True,
-        True,
-    ]
-
-
 def test_preprocessing_requires_model_selection() -> None:
     tokenizer = cast(PreTrainedTokenizerBase, _Tokenizer())
     with pytest.raises(ValueError, match="exactly one concrete model"):
@@ -370,14 +339,26 @@ def test_training_tokenizes_each_exchange_trajectory_once(
     )
     assert calls == len(group.trajectories)
 
-    calls = 0
+    public_calls = 0
+    original_public = art.Trajectory.tokenize
+
+    def counted_public(
+        self: art.Trajectory, *args: Any, **kwargs: Any
+    ) -> TokenizedMultiHistoryTrajectory:
+        nonlocal public_calls
+        public_calls += 1
+        return cast(
+            TokenizedMultiHistoryTrajectory, original_public(self, *args, **kwargs)
+        )
+
+    monkeypatch.setattr(art.Trajectory, "tokenize", counted_public)
     trajectory_groups_to_datums(
         [group],
         renderer=None,
         tokenizer=None,
         model="policy",
     )
-    assert calls == len(group.trajectories)
+    assert public_calls == len(group.trajectories)
 
 
 def test_overlength_history_does_not_claim_sources_from_fitting_history() -> None:
@@ -819,20 +800,19 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     assert len(initial) == 2
     assert len(stripped) == 2
     assert all(result.choice_offsets == [1] for result in initial)
-    assert all(result.choice_offsets == [5] for result in stripped)
+    # The retained response has a different complete visible prefix after its
+    # reasoning is stripped, so it is independently eligible in this history.
+    assert all(result.choice_offsets == [1, 5] for result in stripped)
     assert all(result.assistant_mask == [0, 1, 1, 1, 1] for result in initial)
-    assert all(result.assistant_mask == [0, 0, 0, 0, 0, 1, 1] for result in stripped)
-    assert all(result.weight == pytest.approx(1 / 6) for result in results)
+    assert all(result.assistant_mask == [0, 1, 1, 1, 0, 1, 1] for result in stripped)
+    assert all(result.weight == pytest.approx(1 / 9) for result in results)
     expected_routes = np.asarray(
         [[[10]], [[1010]], [[1020]], [[90]], [[40]], [[50]], [[60]]],
         dtype=np.uint16,
     )
     for result in stripped:
-        assert isinstance(result.moe_routed_experts, MoeRouteSegments)
-        assert np.array_equal(
-            np.concatenate(result.moe_routed_experts.segments),
-            expected_routes,
-        )
+        assert isinstance(result.moe_routed_experts, MoeRouteArray)
+        assert np.array_equal(result.moe_routed_experts, expected_routes)
 
     datums = trajectory_groups_to_datums(
         [group],
@@ -844,7 +824,7 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     )
     masks = [datum.loss_fn_inputs["mask"].to_torch().tolist() for datum in datums]
     assert masks.count([1, 1, 1, 1]) == 2
-    assert masks.count([0, 0, 0, 0, 1, 1]) == 2
+    assert masks.count([1, 1, 1, 0, 1, 1]) == 2
 
 
 def test_ambiguous_non_moe_suffix_falls_back_to_sampled_spans() -> None:
@@ -868,9 +848,9 @@ def test_ambiguous_non_moe_suffix_falls_back_to_sampled_spans() -> None:
             [1, 11, 2, 11],
             [
                 tr.TokenFlag.EXACT,
-                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
                 tr.TokenFlag.EXACT,
-                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
             ],
         )
         is None
@@ -902,10 +882,10 @@ def test_chat_choice_trace_anchors_retained_suffix_at_its_prompt_boundary() -> N
         [1, 8, 9, 7, 8],
         [
             tr.TokenFlag.EXACT,
-            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
             tr.TokenFlag.EXACT,
-            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
         ],
     )
 
@@ -946,7 +926,7 @@ def test_chat_choice_trace_does_bounded_work_for_a_retained_suffix() -> None:
     token_ids = CountingList([1, 7, *([0] * 510)])
     flags = [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
         *([tr.TokenFlag.EXACT] * 510),
     ]
 
