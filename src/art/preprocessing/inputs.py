@@ -24,7 +24,7 @@ def create_train_inputs(
     warmup: bool,
 ) -> TrainInputs:
     """Create TrainInputs for a single batch offset."""
-    return TrainInputs(
+    return TrainInputs(  # ty:ignore[missing-typed-dict-key]
         **{
             k: (
                 v[offset : offset + 1, :1024]
@@ -41,7 +41,7 @@ def create_train_inputs(
             [None] if warmup else packed_tensors["image_grid_thw"][offset : offset + 1]
         ),
         config=(
-            config.model_copy(update={"lr": 1e-9, "beta": 0.0, "kl_coef": 0.0})
+            config.model_copy(update={"learning_rate": 1e-9, "kl_penalty_coef": 0.0})
             if warmup
             else config
         ),

@@ -47,6 +47,7 @@
           "getting-started/about",
           "getting-started/quick-start",
           "getting-started/installation-setup",
+          "getting-started/multi-node",
           "getting-started/notebooks",
           "getting-started/faq"
         ]
@@ -57,7 +58,8 @@
           "fundamentals/training-loop",
           "fundamentals/art-client",
           "fundamentals/art-backend",
-          "fundamentals/ruler"
+          "fundamentals/ruler",
+          "fundamentals/sft-training"
         ]
       },
       {
@@ -66,6 +68,7 @@
           "features/checkpoint-forking",
           "features/checkpoint-deletion",
           "features/additional-histories",
+          "features/tracking-metrics",
           "features/mcp-rl"
         ]
       },

@@ -17,10 +17,9 @@ pip install openpipe-art
 The ART server can be run locally on any machine with a GPU. To install the backend dependencies required for training and inference, you can install the `backend` extra:
 
 ```bash
-pip install openpipe-art[backend]
+pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+  "openpipe-art[backend]"
 ```
-
-
 
 ```python
 from art import TrainableModel, gather_trajectory_groups
@@ -39,6 +38,32 @@ await model.register(backend)
 ... the rest of your code ...
 ```
 
+CUDA 13 hosts use `openpipe-art[backend-cu130]` and the PyTorch `cu130` index.
+
+### Running Megatron
+
+On a supported CUDA 12 trainer image, one install command provides ART's
+controller, Monarch runtime, and the locked Megatron runtime contract:
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+  "openpipe-art[megatron]"
+```
+
+CUDA 13 hosts use `openpipe-art[megatron-cu130]` with
+`https://download.pytorch.org/whl/cu130`. Megatron currently requires Python
+3.12. The first trainer launch materializes the exact trainer environment in a
+content-addressed node-local cache. No ART checkout or `setup.sh` invocation is
+required.
+
+The image remains responsible for the NVIDIA driver and CUDA toolkit. For
+cross-host training it must also provide the NCCL network transport, MOFED/RDMA
+devices, and the kernel capabilities described in the multi-node deployment
+guide. ART validates these before allocating the model.
+
+Tinker users install `openpipe-art[tinker]`; serverless users need only
+`openpipe-art`. These profiles do not install Megatron or vLLM dependencies.
+
 ### Using a managed autoscaling backend
 
 Instead of managing the GPUs and training processes yourself, you can optionally send inference and training requests to the W&B Training cluster, which autoscales to match your job's demand. To do so, install `openpipe-art` without any extras and use `ServerlessBackend`:
@@ -53,36 +78,6 @@ from art import TrainableModel, gather_trajectory_groups
 from art.serverless.backend import ServerlessBackend
 
 backend = ServerlessBackend()
-
-model = TrainableModel(
-    name="agent-001",
-    project="my-agentic-task",
-    base_model="OpenPipe/Qwen3-14B-Instruct",
-)
-
-await model.register(backend)
-
-... the rest of your code ...
-```
-
-### Running the server on remote dedicated GPUs
-
-The ART client can also be run locally and connected to a remote server, which ART will automatically provision for you. To use SkyPilot, you'll need to install the optional dependency:
-
-```bash
-pip install openpipe-art[skypilot]
-```
-
-Then you can use SkyPilotBackend in your code:
-
-```python
-from art import TrainableModel, gather_trajectory_groups
-from art.skypilot.backend import SkyPilotBackend
-
-backend = await SkyPilotBackend.initialize_cluster(
-    cluster_name="my-cluster",
-    gpu="H100"
-)
 
 model = TrainableModel(
     name="agent-001",

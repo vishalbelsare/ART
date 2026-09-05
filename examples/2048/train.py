@@ -14,6 +14,7 @@ random.seed(42)
 
 # Declare the model
 model = art.TrainableModel(
+    run_name="tutorial-001",
     name="tutorial-001",
     project="2048",
     base_model="Qwen/Qwen2.5-3B-Instruct",
@@ -71,9 +72,9 @@ async def train():
             model,
         )
 
-        await model.train(
-            train_groups,
-            config=art.TrainConfig(learning_rate=1e-5),
+        result = await backend.train(model, train_groups, learning_rate=1e-5)
+        await model.log(
+            train_groups, metrics=result.metrics, step=result.step, split="train"
         )
 
 

@@ -236,15 +236,14 @@ async def main():
     # Initialize ART Backend and Model
     backend = LocalBackend()
     model = art.TrainableModel(
+        run_name=MODEL_NAME,
         name=MODEL_NAME,
         project=PROJECT,
         base_model=BASE_MODEL,
+        lora_config=art.LoRAConfig(alpha=8),
         _internal_config=art.dev.InternalModelConfig(
             init_args=art.dev.InitArgs(
                 gpu_memory_utilization=0.75,
-            ),
-            peft_args=art.dev.PeftArgs(
-                lora_alpha=8,
             ),
             trainer_args=art.dev.TrainerArgs(
                 max_grad_norm=0.1,
@@ -325,9 +324,11 @@ async def main():
             )
             continue
 
-        await model.train(
-            valid_train_groups,
-            config=art.TrainConfig(learning_rate=LEARNING_RATE),
+        result = await backend.train(
+            model, valid_train_groups, learning_rate=LEARNING_RATE
+        )
+        await model.log(
+            valid_train_groups, metrics=result.metrics, step=result.step, split="train"
         )
 
         if batch.step > 0 and batch.step % EVAL_STEPS == 0:

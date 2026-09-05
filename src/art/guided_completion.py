@@ -13,36 +13,36 @@ from openai.types.chat.chat_completion_tool_param import ChatCompletionToolParam
 from pydantic import create_model
 
 
-def freeze_tool_schema(tool: dict, fixed_args: dict) -> ChatCompletionToolParam:
+def freeze_tool_schema(
+    tool: ChatCompletionToolParam, fixed_args: dict[str, object]
+) -> ChatCompletionToolParam:
     """
     Return a clone of *tool* whose parameters schema permits *only* `fixed_args`.
     Each field is cast to typing.Literal[value] so Pydantic emits an
     enum-of-one in the JSON schema, which vLLM's `guided_json` accepts.
     """
-    fields = {k: (Literal[v], ...) for k, v in fixed_args.items()}
+    fields = {k: (Literal[v], ...) for k, v in fixed_args.items()}  # ty:ignore[invalid-type-form]
     FrozenModel = create_model(
         f"{tool['function']['name'].title()}FrozenArgs",
-        **fields,  # type: ignore
-    )
+        **fields,
+    )  # ty:ignore[no-matching-overload]
 
     locked = deepcopy(tool)
     locked["function"]["parameters"] = FrozenModel.model_json_schema()
-    return locked  # type: ignore
+    return locked
 
 
 def get_guided_completion_params(
     completion: ChatCompletion,
     base_tools: Iterable[ChatCompletionToolParam] | None = None,
 ) -> Tuple[
-    List[str] | None,
+    List[str | None] | None,
     ChatCompletionToolChoiceOptionParam | None,
-    ChatCompletionToolParam | None,
+    List[ChatCompletionToolParam] | None,
 ]:
     """
     Given a completion from a teacher model, returns chat completion params that can be used to guide a student model's response.
     Useful for RL-based distillation.
-
-    When guiding the student model's completion, remember to set `num_scheduler_steps` to 1.
 
     Args:
         completion: The completion of a teacher model
@@ -50,7 +50,9 @@ def get_guided_completion_params(
 
     Returns a tuple of (guided_choice, tool_choice, tool_params).
     """
-    guided_choice, tool_choice, tool_params = None, None, None
+    guided_choice: List[str | None] | None = None
+    tool_choice: ChatCompletionToolChoiceOptionParam | None = None
+    tool_params: List[ChatCompletionToolParam] | None = None
 
     if (
         completion.choices[0].message.tool_calls
@@ -71,9 +73,9 @@ def get_guided_completion_params(
         }
         chosen_tool = next(t for t in base_tools if t["function"]["name"] == tool_name)
         tool_params = [
-            freeze_tool_schema(chosen_tool, json.loads(tool_call.function.arguments))  # type: ignore
+            freeze_tool_schema(chosen_tool, json.loads(tool_call.function.arguments))
         ]
     else:
         content = completion.choices[0].message.content
         guided_choice = [content]
-    return (guided_choice, tool_choice, tool_params)  # type: ignore
+    return (guided_choice, tool_choice, tool_params)

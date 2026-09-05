@@ -127,7 +127,8 @@ async def train_model(model: art.TrainableModel):
             )
             for scenario in batch.items
         )
-        await model.train(groups)
+        result = await backend.train(model, groups)
+        await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 
         if batch.step % 20 == 0:
             # Every 20 steps let's benchmark our model under training so we can
@@ -174,6 +175,7 @@ async def main():
 
     # We also can define the models we want to train.
     qwen = art.TrainableModel(
+        run_name="qwen-2.5-14b-instruct",
         name="qwen-2.5-14b-instruct",
         project=PROJECT_NAME,
         base_model="Qwen/Qwen2.5-14B-Instruct",

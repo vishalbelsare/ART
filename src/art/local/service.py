@@ -2,6 +2,7 @@ from typing import AsyncIterator, Protocol, runtime_checkable
 
 from .. import dev, types
 from ..preprocessing.pack import DiskPackedTensors
+from ..preprocessing.tokenize import SFTBatch
 
 
 @runtime_checkable
@@ -17,9 +18,21 @@ class ModelService(Protocol):
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
-    ) -> None: ...
+    ) -> tuple[str, int]: ...
 
     async def vllm_engine_is_sleeping(self) -> bool: ...
+
+    async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str: ...
+
+    async def release_exact_adapter(self, step: int) -> None: ...
+
+    async def resolve_global_grad_accumulation_sequences(
+        self, config: types.TrainConfig
+    ) -> int: ...
+
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None: ...
+
+    async def aclose(self) -> None: ...
 
     def train(
         self,
@@ -28,3 +41,21 @@ class ModelService(Protocol):
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]: ...
+
+    def train_sft(
+        self,
+        batches: list[SFTBatch],
+        config: types.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train using SFT on pre-computed batches.
+
+        Args:
+            batches: List of SFTBatch objects to train on.
+            config: SFT batch/grad-accumulation configuration.
+            verbose: Whether to print detailed logs.
+
+        Yields:
+            Dictionary containing training metrics for each batch.
+        """
+        ...

@@ -11,7 +11,6 @@ For detailed documentation and examples, see: https://art.openpipe.ai/fundamenta
 
 import json
 from textwrap import dedent
-from typing import List
 
 from litellm import acompletion
 from litellm.types.utils import ModelResponse
@@ -35,7 +34,7 @@ class TrajectoryScore(BaseModel):
 class Response(BaseModel):
     """Response format expected from the LLM judge."""
 
-    scores: List[TrajectoryScore] = Field(description="The scores for each trajectory.")
+    scores: list[TrajectoryScore] = Field(description="The scores for each trajectory.")
 
 
 DEFAULT_RUBRIC = dedent(
@@ -49,12 +48,50 @@ DEFAULT_RUBRIC = dedent(
 """Default rubric used by RULER. This generic rubric works well for most tasks,
 as RULER extracts task understanding from the system prompts in the trajectories."""
 
+# A malformed relative ranking is usually transient; permit one bounded re-judge.
+_STRUCTURAL_ATTEMPTS = 2
+
+
+def _judge_provider(judge_model: str) -> str | None:
+    provider, separator, _ = judge_model.partition("/")
+    if not separator:
+        return None
+    normalized_provider = provider.strip().lower()
+    if not normalized_provider:
+        return None
+    return normalized_provider
+
+
+def _record_ruler_cost(judge_model: str, response: ModelResponse) -> None:
+    provider = _judge_provider(judge_model)
+    if provider is None:
+        return
+
+    try:
+        from art.metrics import MetricsBuilder
+
+        builder = MetricsBuilder.get_active()
+    except LookupError:
+        return
+
+    try:
+        builder.add_response_cost(
+            "judge/ruler",
+            response,
+            provider=provider,
+            model_name=judge_model,
+        )
+    except ValueError:
+        # RULER supports local and custom LiteLLM models that may not have pricing.
+        return
+
 
 async def ruler(
     message_lists: list[list[ChatCompletionMessageParam]],
     judge_model: str = "openai/o3",
-    extra_litellm_params: dict | None = None,
+    extra_litellm_params: dict[str, object] | None = None,
     rubric: str = DEFAULT_RUBRIC,
+    tools: art.Tools | None = None,
     *,
     debug: bool = False,
 ) -> list[TrajectoryScore]:
@@ -78,9 +115,14 @@ async def ruler(
             - "openai/gpt-4o-mini" - Fast and cost-effective
             - "openai/o3" - Most capable but expensive (default)
             - "anthropic/claude-3-opus-20240229" - Alternative judge
+            - "ollama/qwen3:32b" - Local Ollama judge via LiteLLM
+            The default calls OpenAI through LiteLLM. Set this explicitly for
+            local or custom judge backends.
         extra_litellm_params: Additional parameters to pass to LiteLLM completion.
             Can include temperature, max_tokens, etc.
         rubric: The grading rubric. The default rubric works well for most tasks.
+        tools: Optional list of tool definitions available to the agent. When provided,
+            the judge will see which tools were available when evaluating tool usage.
         debug: If True, pretty-print the judge's reasoning to help understand scores.
 
     Returns:
@@ -137,9 +179,15 @@ async def ruler(
             "<context>\n" + json.dumps(common_prefix_messages) + "\n</context>\n\n"
         )
 
+    # Include available tools so the judge knows which tool calls are valid
+    if tools:
+        user_text += (
+            "<available_tools>\n" + json.dumps(tools) + "\n</available_tools>\n\n"
+        )
+
     # Serialize each trajectory (minus the common prefix) for the judge.
     # If all trajectories are identical, only serialize one full trajectory to save tokens.
-    serialized_trajectories: List[str] = []
+    serialized_trajectories: list[str] = []
     if all_identical:
         # Send the full trajectory since they're all identical
         full_trajectory = message_lists[0]
@@ -167,60 +215,120 @@ async def ruler(
         """
     )
 
-    messages = [
+    expected_scores = 1 if all_identical else len(message_lists)
+    expected_ids = [str(index) for index in range(1, expected_scores + 1)]
+    required_ids = ", ".join(expected_ids)
+    judge_prompt += dedent(
+        f"""
+
+        Return exactly {expected_scores} score object{"" if expected_scores == 1 else "s"},
+        one for each of these trajectory IDs, with no duplicates or omissions:
+        {required_ids}
+        """
+    )
+
+    messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": judge_prompt},
         {"role": "user", "content": user_text},
     ]
 
-    response = await acompletion(
-        model=judge_model,
-        messages=messages,
-        response_format=Response,
-        caching=False,
-        **extra_litellm_params if extra_litellm_params else {},
-    )
-    assert isinstance(response, ModelResponse)
+    for attempt in range(_STRUCTURAL_ATTEMPTS):
+        response = await acompletion(
+            model=judge_model,
+            messages=messages,
+            response_format=Response,
+            caching=False,
+            **extra_litellm_params if extra_litellm_params else {},
+        )
+        assert isinstance(response, ModelResponse)
+        _record_ruler_cost(judge_model, response)
 
-    if len(response.choices) == 0:
-        raise ValueError(f"No choices in response: {response}")
-    first_choice = response.choices[0]
+        if len(response.choices) == 0:
+            raise ValueError(f"No choices in response: {response}")
+        first_choice = response.choices[0]
 
-    if debug:
-        raw_content = first_choice.message.content or "{}"  # type: ignore[attr-defined]
-        try:
-            print("\n[RULER] Pretty-printed LLM choice JSON:")
-            print(json.loads(raw_content))
-        except json.JSONDecodeError as e:
-            print(f"[RULER] Could not parse choice content as JSON: {e}")
-            print(f"[RULER] Raw choice content: {raw_content}")
+        if debug:
+            raw_content = first_choice.message.content or "{}"
+            try:
+                print("\n[RULER] Pretty-printed LLM choice JSON:")
+                print(json.loads(raw_content))
+            except json.JSONDecodeError as e:
+                print(f"[RULER] Could not parse choice content as JSON: {e}")
+                print(f"[RULER] Raw choice content: {raw_content}")
 
-    content = first_choice.message.content or "{}"  # type: ignore[attr-defined]
-    parsed = Response.model_validate_json(content)
-
-    # If all trajectories were identical, we only sent one to the judge
-    # Duplicate the score for all trajectories
-    if all_identical:
-        if len(parsed.scores) != 1:
-            raise ValueError(
-                f"Expected 1 score for identical trajectories, but got {len(parsed.scores)}"
+        content = first_choice.message.content or "{}"
+        parsed = Response.model_validate_json(content)
+        structure_error: ValueError | None = None
+        if len(parsed.scores) != expected_scores:
+            qualifier = " for identical trajectories" if all_identical else ""
+            structure_error = ValueError(
+                f"Expected {expected_scores} score{'' if expected_scores == 1 else 's'}"
+                f"{qualifier}, but got {len(parsed.scores)}"
             )
-        single_score = parsed.scores[0]
-        return [
-            single_score.model_copy(update={"trajectory_id": str(i)})
-            for i in range(1, len(message_lists) + 1)
+        scores_by_id = {score.trajectory_id: score for score in parsed.scores}
+        received_ids = [score.trajectory_id for score in parsed.scores]
+        missing_ids = [
+            trajectory_id
+            for trajectory_id in expected_ids
+            if trajectory_id not in scores_by_id
         ]
-    else:
-        if len(parsed.scores) != len(message_lists):
-            raise ValueError(
-                f"Expected {len(message_lists)} scores, but got {len(parsed.scores)}"
+        duplicate_ids = sorted(
+            {
+                trajectory_id
+                for trajectory_id in received_ids
+                if received_ids.count(trajectory_id) > 1
+            }
+        )
+        unexpected_ids = sorted(set(received_ids) - set(expected_ids))
+        if structure_error is None and (
+            len(scores_by_id) != expected_scores
+            or set(scores_by_id) != set(expected_ids)
+        ):
+            structure_error = ValueError(
+                f"Expected trajectory ids {expected_ids}, but got "
+                f"{[score.trajectory_id for score in parsed.scores]}"
             )
-        return parsed.scores
+        if structure_error is not None:
+            if attempt + 1 < _STRUCTURAL_ATTEMPTS:
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Your response had {len(parsed.scores)} score object"
+                            f"{'' if len(parsed.scores) == 1 else 's'}; expected "
+                            f"{expected_scores}. Missing trajectory IDs: "
+                            f"{', '.join(missing_ids) or 'none'}. Duplicate trajectory "
+                            f"IDs: {', '.join(duplicate_ids) or 'none'}. Unexpected "
+                            f"trajectory IDs: {', '.join(unexpected_ids) or 'none'}. "
+                            f"Return one complete replacement using each trajectory ID "
+                            f"exactly once: {required_ids}."
+                        ),
+                    },
+                ]
+                continue
+            raise structure_error
+
+        ordered_scores = [scores_by_id[trajectory_id] for trajectory_id in expected_ids]
+
+        # If all trajectories were identical, we only sent one to the judge.
+        # Duplicate the score for all trajectories.
+        if all_identical:
+            single_score = ordered_scores[0]
+            return [
+                single_score.model_copy(update={"trajectory_id": str(i)})
+                for i in range(1, len(message_lists) + 1)
+            ]
+        return ordered_scores
+
+    raise AssertionError("RULER structural retry loop did not return")
 
 
 async def ruler_score_group(
     group: art.TrajectoryGroup,
     judge_model: str = "openai/o3",
-    extra_litellm_params: dict | None = None,
+    extra_litellm_params: dict[str, object] | None = None,
     rubric: str = DEFAULT_RUBRIC,
     *,
     swallow_exceptions: bool = False,
@@ -274,6 +382,7 @@ async def ruler_score_group(
     for t in group.trajectories:
         # Create a new trajectory with the same data but fresh objects
         new_traj = t.__class__(
+            exchanges=t.exchanges.model_copy(deep=True),
             messages_and_choices=t.messages_and_choices.copy(),
             tools=t.tools.copy() if t.tools else None,
             additional_histories=[
@@ -286,19 +395,25 @@ async def ruler_score_group(
         )
         new_trajectories.append(new_traj)
 
-    # Extract message lists and preserve original rewards for comparison
-    message_lists: list[list[ChatCompletionMessageParam]] = []
-    for traj in new_trajectories:
-        message_lists.append(traj.messages())
-        traj.metrics["independent_reward"] = traj.reward
+    for trajectory in new_trajectories:
+        trajectory.metrics["independent_reward"] = trajectory.reward
 
     try:
+        histories = [
+            trajectory.history().as_chat_completions_history()
+            for trajectory in new_trajectories
+        ]
+        message_lists: list[list[ChatCompletionMessageParam]] = [
+            history.messages for history in histories
+        ]
+        tools = histories[0].tools if histories else None
         # Call the core ruler function to get scores
         scores = await ruler(
             message_lists,
             judge_model=judge_model,
             extra_litellm_params=extra_litellm_params,
             rubric=rubric,
+            tools=tools,
             debug=debug,
         )
     except Exception as e:

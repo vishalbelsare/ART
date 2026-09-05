@@ -1,11 +1,16 @@
 import os
+from typing import cast
 
 from mp_actors import move_to_child_process
 
+from .. import dev
+from ..backend import AnyTrainableModel
+from ..costs import build_cost_calculator, get_model_pricing
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
-from ..model import TrainableModel
+from ..model import Model, TrainableModel
 from ..utils.output_dirs import get_model_dir
+from .renderers import get_renderer_name
 
 
 class TinkerBackend(LocalBackend):
@@ -24,81 +29,60 @@ class TinkerBackend(LocalBackend):
             os.environ["TINKER_API_KEY"] = tinker_api_key
         super().__init__(in_process=in_process, path=path)
 
+    async def register(self, model: Model) -> None:
+        await super().register(model)
+        if not model.trainable:
+            return
+        trainable_model = cast(TrainableModel, model)
+        pricing = get_model_pricing(trainable_model.base_model)
+        if pricing is not None:
+            trainable_model.set_cost_calculator(build_cost_calculator(pricing))
+
+    async def _prepare_backend_for_training(
+        self,
+        model: AnyTrainableModel,
+        config: dev.OpenAIServerConfig | None = None,
+    ) -> tuple[str, str]:
+        api_key = os.environ["TINKER_API_KEY"]
+        config_dict: dict = dict(config or {})
+        server_args = dict(config_dict.get("server_args", {}))
+        server_args["api_key"] = api_key
+        config_dict["server_args"] = server_args
+        base_url, _ = await super()._prepare_backend_for_training(model, config)
+        return base_url, api_key
+
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
-        from ..dev.model import TinkerArgs
+        from ..dev.model import TinkerArgs, TinkerTrainingClientArgs
         from .service import TinkerService
 
-        if model.name not in self._services:
+        storage_key = self._model_storage_key(model)
+        if storage_key not in self._services:
             config = get_model_config(
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
+                lora_config=model.lora_config,
             )
             config["tinker_args"] = config.get("tinker_args") or TinkerArgs(
                 renderer_name=get_renderer_name(model.base_model)
             )
-            config["tinker_args"]["training_client_args"] = (
-                config["tinker_args"].get("training_client_args") or {}
+            config["tinker_args"]["training_client_args"] = cast(
+                TinkerTrainingClientArgs,
+                config["tinker_args"].get("training_client_args") or {},
             )
-            self._services[model.name] = TinkerService(
-                model_name=model.name,
-                base_model=model.base_model,
-                config=config,
-                output_dir=get_model_dir(model=model, art_path=self._path),
+            self._services[storage_key] = cast(
+                ModelService,
+                TinkerService(
+                    model_name=model.name,
+                    base_model=model.base_model,
+                    config=config,
+                    output_dir=get_model_dir(model=model, art_path=self._path),
+                ),
             )
             if not self._in_process:
-                self._services[model.name] = move_to_child_process(
-                    self._services[model.name],
+                self._services[storage_key] = move_to_child_process(
+                    self._services[storage_key],
                     process_name="tinker-service",
                 )
-        return self._services[model.name]
-
-
-renderer_name_message = """
-To manually specify a renderer (and silence this message), you can set the "renderer_name" field like so:
-
-model = art.TrainableModel(
-    name="my-model",
-    project="my-project",
-    base_model="Qwen/Qwen3-8B",
-    _internal_config=art.dev.InternalModelConfig(
-        tinker_args=art.dev.TinkerArgs(renderer_name="qwen3_disable_thinking"),
-    ),
-)
-
-Valid renderer names are:
-
-- llama3
-- qwen3
-- qwen3_disable_thinking
-- qwen3_instruct
-- deepseekv3
-- deepseekv3_disable_thinking
-- gpt_oss_no_sysprompt
-- gpt_oss_low_reasoning
-- gpt_oss_medium_reasoning
-- gpt_oss_high_reasoning
-""".strip()
-
-
-def get_renderer_name(base_model: str) -> str:
-    if base_model.startswith("meta-llama/"):
-        return "llama3"
-    elif base_model.startswith("Qwen/Qwen3-"):
-        if "Instruct" in base_model:
-            return "qwen3_instruct"
-        else:
-            print("Defaulting to Qwen3 renderer without thinking for", base_model)
-            print(renderer_name_message)
-            return "qwen3_disable_thinking"
-    elif base_model.startswith("deepseek-ai/DeepSeek-V3"):
-        print("Defaulting to DeepSeekV3 renderer without thinking for", base_model)
-        print(renderer_name_message)
-        return "deepseekv3_disable_thinking"
-    elif base_model.startswith("openai/gpt-oss"):
-        print("Defaulting to GPT-OSS renderer without system prompt for", base_model)
-        print(renderer_name_message)
-        return "gpt_oss_no_sysprompt"
-    else:
-        raise ValueError(f"Unknown base model: {base_model}")
+        return self._services[storage_key]

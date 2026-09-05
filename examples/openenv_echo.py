@@ -64,8 +64,10 @@ async def main() -> None:
     backend = ServerlessBackend()
 
     # We define a model that we'll train. The model is a LoRA adapter on top of Qwen3-14B.
+    run_name = f"openenv-echo-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
     model = art.TrainableModel(
-        name=f"openenv-echo-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}",
+        name=run_name,
+        run_name=run_name,
         project="openenv-demo",
         base_model="OpenPipe/Qwen3-14B-Instruct",
     )
@@ -86,7 +88,8 @@ async def main() -> None:
             [art.TrajectoryGroup(rollout(model, env_client) for env_client in env_pool)]
         )
 
-        await model.train(groups)
+        result = await backend.train(model, groups)
+        await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 
 
 asyncio.run(main())
